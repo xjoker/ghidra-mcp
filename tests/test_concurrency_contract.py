@@ -39,6 +39,16 @@ def _register(registry: ToolRegistry, name: str, handler, *, mutates: bool) -> N
     registry.register(ToolDefinition(name, DESCRIPTION, handler, mutates=mutates))
 
 
+def _session_namer(arguments: dict) -> str | None:
+    """Test helper: key by program_id / binary_path without a workspace mapping."""
+
+    if "program_id" in arguments:
+        return str(arguments["program_id"])
+    if "binary_path" in arguments:
+        return str(Path(str(arguments["binary_path"])).resolve())
+    return None
+
+
 def test_program_gates_share_readers_and_serialize_the_writer() -> None:
     from ghidra_mcp.concurrency import ProgramGates
 
@@ -77,7 +87,13 @@ def test_executor_runs_shared_tools_concurrently() -> None:
     registry = ToolRegistry()
     _register(registry, "shared", probe, mutates=False)
     executor = GhidraToolExecutor(max_workers=4)
-    app = create_mcp_app(registry, host="127.0.0.1", port=8765, tool_executor=executor)
+    app = create_mcp_app(
+        registry,
+        host="127.0.0.1",
+        port=8765,
+        tool_executor=executor,
+        resource_namer=_session_namer,
+    )
     tool = app._tool_manager._tools["shared"]
 
     async def exercise() -> None:
@@ -99,7 +115,13 @@ def test_executor_serializes_mutating_tools_for_the_same_program() -> None:
     registry = ToolRegistry()
     _register(registry, "exclusive", probe, mutates=True)
     executor = GhidraToolExecutor(max_workers=4)
-    app = create_mcp_app(registry, host="127.0.0.1", port=8765, tool_executor=executor)
+    app = create_mcp_app(
+        registry,
+        host="127.0.0.1",
+        port=8765,
+        tool_executor=executor,
+        resource_namer=_session_namer,
+    )
     tool = app._tool_manager._tools["exclusive"]
 
     async def exercise() -> None:
@@ -121,7 +143,13 @@ def test_executor_runs_mutations_on_distinct_programs_in_parallel() -> None:
     registry = ToolRegistry()
     _register(registry, "exclusive", probe, mutates=True)
     executor = GhidraToolExecutor(max_workers=4)
-    app = create_mcp_app(registry, host="127.0.0.1", port=8765, tool_executor=executor)
+    app = create_mcp_app(
+        registry,
+        host="127.0.0.1",
+        port=8765,
+        tool_executor=executor,
+        resource_namer=_session_namer,
+    )
     tool = app._tool_manager._tools["exclusive"]
 
     async def exercise() -> None:

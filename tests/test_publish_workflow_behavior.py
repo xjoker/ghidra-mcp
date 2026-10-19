@@ -39,6 +39,8 @@ ALLOWED_PUBLISH_ACTIONS = {
 CANDIDATE_IMAGE = '"${IMAGE_NAME}@${{ steps.image.outputs.digest }}"'
 # The candidate image as one shell word, after shlex has removed the quotes.
 CANDIDATE_WORD = "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
+VERSION_TAG_WORD = "${IMAGE_NAME}:${{ steps.version.outputs.value }}"
+LATEST_TAG_WORD = "${IMAGE_NAME}:latest"
 
 
 @dataclass
@@ -569,6 +571,16 @@ SHELL_TERMINATORS = {"fi", "done", "}", "]]"}
 DOCKER_SUBCOMMANDS = {"pull", "run", "logs", "manifest", "buildx", "rm"}
 # Only the forms today's publish job needs. Anything else, such as
 # `docker buildx build --push` or `docker manifest push`, is rejected.
+# Exact argv (after `docker <subcommand>`) for the read-only and cleanup forms.
+DOCKER_EXACT_ARGS = {
+    "pull": [[CANDIDATE_WORD]],
+    "logs": [["ghidra-mcp-ci"]],
+    "rm": [["-f", "ghidra-mcp-ci"]],
+    "manifest": [["inspect", VERSION_TAG_WORD]],
+}
+IMAGETOOLS_INSPECT_ARGS = [VERSION_TAG_WORD, "--format", "{{json .Manifest.Digest}}"]
+# `imagetools create` may only promote the verified candidate to these tags.
+IMAGETOOLS_CREATE_TAGS = {VERSION_TAG_WORD, LATEST_TAG_WORD}
 DOCKER_NESTED_SUBCOMMANDS = {
     "buildx": {("imagetools", "create"), ("imagetools", "inspect")},
     "manifest": {("inspect",)},
@@ -579,11 +591,28 @@ DOCKER_RUN_FLAGS = {"-d"}
 DOCKER_RUN_OPTIONS = {
     "--name": re.compile(r"^ghidra-mcp-ci$"),
     "--network": re.compile(r"^host$"),
-    "-e": re.compile(r"^GHIDRA_MCP_(PUBLIC_URL|AUTH_TOKEN)="),
+    "-e": re.compile(
+        r"^(GHIDRA_MCP_PUBLIC_URL=http://127\.0\.0\.1:[0-9]+|GHIDRA_MCP_AUTH_TOKEN=\$TOKEN)$"
+    ),
 }
 # Plain fetches only: no -L/--location, -o/-O, -H, -x, --resolve, --unix-socket.
 CURL_OPTIONS = {"-f", "-s", "-S", "-fsS", "--fail", "--silent", "--show-error"}
 LOCAL_URL = re.compile(r"^http://127\.0\.0\.1:[0-9]+(/[A-Za-z0-9._~/-]*)?$")
+# Shell variables the publish job may set, only as plain `NAME=value` statements.
+# A prefix assignment (`LD_PRELOAD=x docker ...`) or any other name (PATH,
+# BASH_ENV, IFS, ...) is rejected. `for` may only bind `_`.
+ALLOWED_ASSIGNMENTS = {"VERSION", "TOKEN", "HEALTH", "VERSION_DIGEST", "INSPECT_ERROR"}
+ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=")
+# The only redirections the publish job uses, as (fd, operator, target). Writes
+# to any other file, including $GITHUB_ENV and $GITHUB_PATH, are rejected.
+ALLOWED_REDIRECTIONS = {
+    ("", "<", "VERSION"),
+    ("", ">>", "$GITHUB_OUTPUT"),
+    ("", ">&", "2"),
+    ("2", ">&", "1"),
+    ("2", ">", "/dev/null"),
+    ("", "<<<", "$INSPECT_ERROR"),
+}
 SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
 REDIRECTIONS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "&>", ">|"}
 
@@ -618,9 +647,10 @@ def _split_substitutions(line: str) -> tuple[str, list[str]]:
     return "".join(out), inner
 
 
-def _simple_commands(line: str) -> list[list[str]]:
+def _simple_commands(line: str, problems: list[str]) -> list[list[str]]:
+    """Split a line into simple commands; append redirection/assignment problems."""
     outer, inner = _split_substitutions(line)
-    commands = [command for script in inner for command in _simple_commands(script)]
+    commands = [command for script in inner for command in _simple_commands(script, problems)]
     lexer = shlex.shlex(outer, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     current: list[str] = []
@@ -639,6 +669,12 @@ def _simple_commands(line: str) -> list[list[str]]:
             commands.append(current)
             current = []
         elif token in REDIRECTIONS:
+            # shlex splits `2>&1` into "2", ">&", "1": a bare fd number before the
+            # operator belongs to the redirection, not to the command.
+            fd = current.pop() if current and current[-1].isdigit() else ""
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if (fd, token, target) not in ALLOWED_REDIRECTIONS:
+                problems.append(f"redirection {fd}{token} {target} is not allowed: {line}")
             index += 1  # skip the redirection target
         else:
             current.append(token)
@@ -646,10 +682,19 @@ def _simple_commands(line: str) -> list[list[str]]:
     commands.append(current)
     simple = []
     for words in commands:
-        while words and (
-            words[0] in SHELL_KEYWORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
-        ):
+        while words and words[0] in SHELL_KEYWORDS:
             words = words[1:]
+        assignments = []
+        while words and ASSIGNMENT.match(words[0]):
+            assignments.append(ASSIGNMENT.match(words[0]).group(1))
+            words = words[1:]
+        for name in assignments:
+            if name not in ALLOWED_ASSIGNMENTS:
+                problems.append(f"assignment to {name} is not allowed: {line}")
+        if assignments and words and words[0] not in SHELL_TERMINATORS:
+            problems.append(f"environment prefix before {words[0]!r} is not allowed: {line}")
+        if words[:1] == ["for"] and words[1:3] != ["_", "in"]:
+            problems.append(f"for loop variable other than _: {line}")
         if not words or words[0] in SHELL_TERMINATORS or words[0] == "for":
             continue
         simple.append(words)
@@ -673,6 +718,25 @@ def _docker_run_problems(args: list[str], line: str) -> list[str]:
     return []
 
 
+def _imagetools_create_problems(args: list[str], line: str) -> list[str]:
+    tags, sources = [], []
+    index = 0
+    while index < len(args):
+        if args[index] == "--tag" and index + 1 < len(args):
+            tags.append(args[index + 1])
+            index += 2
+        elif args[index].startswith("-"):
+            return [f"imagetools create option {args[index]} is not allowed: {line}"]
+        else:
+            sources.append(args[index])
+            index += 1
+    if not tags or not set(tags) <= IMAGETOOLS_CREATE_TAGS:
+        return [f"imagetools create tags other than version/latest: {line}"]
+    if sources != [CANDIDATE_WORD]:
+        return [f"imagetools create from anything but the candidate: {line}"]
+    return []
+
+
 def _docker_problems(words: list[str], line: str) -> list[str]:
     subcommand = words[1] if len(words) > 1 else ""
     if subcommand not in DOCKER_SUBCOMMANDS:
@@ -680,8 +744,12 @@ def _docker_problems(words: list[str], line: str) -> list[str]:
     nested = DOCKER_NESTED_SUBCOMMANDS.get(subcommand)
     if nested is not None and not any(tuple(words[2 : 2 + len(form)]) == form for form in nested):
         return [f"docker {subcommand} {' '.join(words[2:4])} is not allowed: {line}"]
-    if subcommand == "pull" and words[2:] != [CANDIDATE_WORD]:
-        return [f"docker pull of anything but the candidate: {line}"]
+    if subcommand in DOCKER_EXACT_ARGS and words[2:] not in DOCKER_EXACT_ARGS[subcommand]:
+        return [f"docker {subcommand} with other arguments than the workflow's: {line}"]
+    if words[2:4] == ["imagetools", "inspect"] and words[4:] != IMAGETOOLS_INSPECT_ARGS:
+        return [f"imagetools inspect of anything but the version tag: {line}"]
+    if words[2:4] == ["imagetools", "create"]:
+        return _imagetools_create_problems(words[4:], line)
     if subcommand == "run":
         return _docker_run_problems(words[2:], line)
     return []
@@ -705,7 +773,7 @@ def _disallowed_commands(script: str) -> list[str]:
             # nested in them would hide behind an allowed one such as echo.
             problems.append(f"backtick command substitution: {line}")
             continue
-        for words in _simple_commands(line):
+        for words in _simple_commands(line, problems):
             command = words[0]
             if command not in ALLOWED_COMMANDS:
                 problems.append(f"{command!r} is not allowed: {line}")
@@ -793,19 +861,101 @@ def test_publish_command_allowlist_rejects_review_gaps(script: str) -> None:
     assert _disallowed_commands(script)
 
 
+VERSION_TAG = '"${IMAGE_NAME}:${{ steps.version.outputs.value }}"'
+LATEST_TAG = '"${IMAGE_NAME}:latest"'
+PROMOTE = f"docker buildx imagetools create --tag {VERSION_TAG} --tag {LATEST_TAG} "
+
+
+# Verbatim forms from publish-container.yml; the tightened allowlist must keep
+# accepting them (test_publish_job_runs_only_allowlisted_commands checks the
+# real file; these pin each form on its own).
 @pytest.mark.parametrize(
     "script",
     [
         "docker pull " + CANDIDATE_IMAGE,
         CANDIDATE_RUN + "-e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 " + CANDIDATE_IMAGE,
-        "docker buildx imagetools create --tag x " + CANDIDATE_IMAGE,
-        "docker buildx imagetools inspect x --format '{{json .Manifest.Digest}}'",
-        'if X="$(docker manifest inspect "${IMAGE_NAME}:v" 2>&1)"; then exit 1; fi',
+        PROMOTE + CANDIDATE_IMAGE,
+        f'VERSION_DIGEST="$(docker buildx imagetools inspect {VERSION_TAG} '
+        "--format '{{json .Manifest.Digest}}' | tr -d '\"')\"",
+        f'if INSPECT_ERROR="$(docker manifest inspect {VERSION_TAG} 2>&1)"; then exit 1; fi',
+        "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then exit 1; fi",
         'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
+        "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
+        'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
+        'echo "VERSION $VERSION does not match" >&2',
+        "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
+        "for _ in $(seq 1 30); do sleep 2; done",
+        "docker logs ghidra-mcp-ci",
+        "docker rm -f ghidra-mcp-ci 2>/dev/null || true",
     ],
 )
 def test_publish_command_allowlist_accepts_the_forms_in_use(script: str) -> None:
     assert _disallowed_commands(script) == []
+
+
+# SAF-44 round 2: bypasses found in the PR #17 review. Each passed the round-1
+# allowlist; each must keep failing it.
+@pytest.mark.parametrize(
+    "script",
+    [
+        # imagetools create must promote only the candidate, only to version/latest.
+        pytest.param(
+            "docker buildx imagetools create --tag ghcr.io/x/y:latest alpine",
+            id="imagetools-other-src",
+        ),
+        pytest.param(
+            f"docker buildx imagetools create --tag {LATEST_TAG} alpine {CANDIDATE_IMAGE}",
+            id="imagetools-multi-src",
+        ),
+        pytest.param(PROMOTE + "alpine", id="imagetools-create-alpine"),
+        pytest.param(
+            "docker buildx imagetools create --tag ghcr.io/evil/x:latest " + CANDIDATE_IMAGE,
+            id="imagetools-foreign-tag",
+        ),
+        pytest.param(
+            f"docker buildx imagetools create --tag={LATEST_TAG} {CANDIDATE_IMAGE}",
+            id="imagetools-tag-equals",
+        ),
+        pytest.param(PROMOTE + "--append " + CANDIDATE_IMAGE, id="imagetools-extra-option"),
+        pytest.param("docker buildx imagetools create " + CANDIDATE_IMAGE, id="imagetools-no-tag"),
+        pytest.param(
+            "docker buildx imagetools inspect alpine --format '{{json .Manifest.Digest}}'",
+            id="imagetools-inspect-other",
+        ),
+        pytest.param("docker manifest inspect alpine", id="manifest-inspect-other"),
+        # No environment prefixes, no assignments to other variables.
+        pytest.param("LD_PRELOAD=/tmp/x.so " + CANDIDATE_RUN + CANDIDATE_IMAGE, id="ld-preload"),
+        pytest.param("PATH=/evil docker pull " + CANDIDATE_IMAGE, id="path-inject"),
+        pytest.param("BASH_ENV=/tmp/evil docker pull " + CANDIDATE_IMAGE, id="bash-env"),
+        pytest.param("HEALTH=x docker pull " + CANDIDATE_IMAGE, id="allowed-name-as-prefix"),
+        pytest.param("PATH=/evil", id="path-assignment"),
+        pytest.param("SHELLOPTS=xtrace; docker logs ghidra-mcp-ci", id="shellopts-assignment"),
+        pytest.param("for PATH in /evil; do docker logs ghidra-mcp-ci; done", id="for-binds-path"),
+        # Redirections only to the targets the workflow uses.
+        pytest.param("printf 'pwned' > /tmp/evil", id="redir-write"),
+        pytest.param("echo pwned > /home/runner/.docker/config.json", id="redir-docker-config"),
+        pytest.param("echo pwned >> /home/runner/.docker/config.json", id="redir-append"),
+        pytest.param('echo "LD_PRELOAD=/tmp/x.so" >> "$GITHUB_ENV"', id="redir-github-env"),
+        pytest.param('echo /evil >> "$GITHUB_PATH"', id="redir-github-path"),
+        pytest.param('echo x > "$GITHUB_OUTPUT"', id="redir-truncate-output"),
+        pytest.param("echo x &> /tmp/evil", id="redir-both-streams"),
+        pytest.param("echo x 2> /tmp/evil", id="redir-stderr-file"),
+        pytest.param("echo x <<EOF", id="redir-heredoc"),
+        # Low items from the review, closed while here.
+        pytest.param(
+            CANDIDATE_RUN + "-e GHIDRA_MCP_PUBLIC_URL=http://evil.example/ " + CANDIDATE_IMAGE,
+            id="env-evil-url",
+        ),
+        pytest.param(
+            "docker run -d -e GHIDRA_MCP_AUTH_TOKEN=known " + CANDIDATE_IMAGE,
+            id="env-fixed-token",
+        ),
+        pytest.param("docker logs anything-at-all", id="logs-other"),
+        pytest.param("docker rm -f anything", id="rm-other"),
+    ],
+)
+def test_publish_command_allowlist_rejects_review_r2_gaps(script: str) -> None:
+    assert _disallowed_commands(script)
 
 
 def test_publish_job_runs_only_allowlisted_commands() -> None:

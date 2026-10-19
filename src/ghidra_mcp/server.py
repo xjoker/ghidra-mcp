@@ -117,8 +117,12 @@ class GhidraToolExecutor:
 def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any) -> Any:
     @wraps(tool.handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        # 单 worker 不使用闸门，因此不在事件循环上推导资源键，保持与单线程执行器相同的调用路径。
-        resource = resource_namer(kwargs) if executor.max_workers > 1 else None
+        # 单 worker 不使用闸门，因此不推导资源键，保持与单线程执行器相同的调用路径。
+        # 多 worker 时资源键（含 Path.resolve）放到线程池，避免在事件循环线程上做 realpath/lstat。
+        if executor.max_workers > 1:
+            resource = await asyncio.to_thread(resource_namer, kwargs)
+        else:
+            resource = None
         return await executor.run(
             tool.handler,
             args,
@@ -203,6 +207,14 @@ def create_mcp_app(
     max_workers: int = 1,
     resource_namer: Any = None,
 ) -> FastMCP:
+    """绑定工具注册表到 FastMCP。
+
+    max_workers（或传入的 tool_executor.max_workers）大于 1 时必须提供 resource_namer，
+    把 program_id 映射到与 binary_path 相同的底层二进制键（例如
+    ``partial(program_resource_key, resolve_program=workspace.resource_key)``）；
+    否则同一二进制的各会话不会互斥。默认 CLI 路径走 ``create_service``，已传入该映射。
+    """
+
     auth = None
     verifier = None
     if auth_token is not None:
@@ -225,6 +237,10 @@ def create_mcp_app(
         token_verifier=verifier,
     )
     executor = tool_executor or GhidraToolExecutor(max_workers=max_workers)
+    if executor.max_workers > 1 and resource_namer is None:
+        raise ValueError(
+            "max_workers 大于 1 时必须提供 resource_namer，以便将同一二进制的各会话映射到同一闸门"
+        )
     namer = resource_namer or program_resource_key
     for tool in registry.enabled_tools():
         app.tool(

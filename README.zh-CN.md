@@ -108,6 +108,8 @@ MCP 客户端应自行拉起 stdio 进程。等价通用配置如下：
 
 公开 URL 不能包含 wildcard host、用户信息、查询参数或路径前缀。敏感值只从环境变量或未跟踪 `.env` 读取；不要把真实 token 写入 TOML、日志、命令历史或 Git。
 
+当 `GHIDRA_MCP_MAX_WORKERS > 1` 时，互不相关的工具调用会在不同的 JVM worker 线程上运行。同一程序上的只读调用（例如 `decompile_function`）可以并发，写入调用则拿独占的按程序闸门，因此 Ghidra 事务与存盘不会重叠。生命周期调用（`program_open`、`program_close`）按底层二进制键控，同一二进制的并发会话仍会串行。调用先等待程序闸门再占用 worker，因此忙碌的程序不会拖住其它程序上的调用；已在等待的写入不会被晚到的读取插队；在优雅退出（stdin EOF 或传输正常返回）时，服务器会等正在运行的调用结束后再关闭程序。SIGTERM 今天不会走这段排空——进程在未执行 `close_all` 的情况下退出，与单 worker 时相同——因此进行中的事务或存盘可能被打断；stdio/退出侧的后续修复会覆盖该缺口（SAF-19）。
+
 ## 文档
 
 项目的详细文档以英文为主，统一维护在 [GitHub Wiki](https://github.com/xjoker/ghidra-mcp/wiki)：

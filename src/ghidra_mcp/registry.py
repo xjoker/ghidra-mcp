@@ -24,6 +24,8 @@ class ToolDefinition:
     group: str = "default"
     contract_version: int = 1
     annotations: ToolAnnotations | None = None
+    # 默认按写操作对待，使忘记标注的工具退化为串行而不是并发写坏程序。
+    mutates: bool = True
 
     def __post_init__(self) -> None:
         if self.contract_version < 1:

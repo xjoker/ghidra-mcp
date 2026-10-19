@@ -149,6 +149,7 @@ def register_operation_tools(registry: ToolRegistry, workspace: ProgramWorkspace
             "memory_search",
             """在已初始化内存中搜索精确字节模式。\n\n输入输出与副作用：输入程序会话、十六进制模式和结果上限；返回匹配地址，单次最多扫描 64 MiB；只读。\n\n何时使用：按机器码、常量或文件签名定位地址时调用；已知地址读取内容用 memory_read，文本线索用 strings_list。\n""",
             memory_search,
+            mutates=False,
         ),
         ToolDefinition(
             "analysis_run",
@@ -159,6 +160,7 @@ def register_operation_tools(registry: ToolRegistry, workspace: ProgramWorkspace
             "data_type_get",
             """按完整路径读取一个数据类型。\n\n输入输出与副作用：输入程序会话和类型路径；返回名称、路径、长度与说明；只读。\n\n何时使用：应用类型前核对精确定义；按片段发现候选类型用 data_types_list。\n""",
             data_type_get,
+            mutates=False,
         ),
         ToolDefinition(
             "data_type_apply",

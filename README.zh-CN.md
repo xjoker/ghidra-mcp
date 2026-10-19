@@ -97,6 +97,7 @@ MCP 客户端应自行拉起 stdio 进程。等价通用配置如下：
 |---|---:|---|
 | `GHIDRA_INSTALL_DIR` | 无 | Ghidra 安装目录；必填 |
 | `GHIDRA_MCP_ANALYSIS_TIMEOUT_SECONDS` | `300` | 自动分析期限，范围 1–3600 秒 |
+| `GHIDRA_MCP_MAX_WORKERS` | `1` | JVM worker 线程数，范围 1–64；同一程序的只读调用并行、写入仍逐程序串行 |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | `stdio` 或 `streamable-http` |
 | `GHIDRA_MCP_HOST` | `127.0.0.1` | HTTP 监听地址 |
 | `GHIDRA_MCP_PORT` | `8765` | HTTP 端口，范围 1–65535 |

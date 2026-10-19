@@ -272,6 +272,7 @@ def register_listing_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
             """,
             instructions_list,
             contract_version=2,
+            mutates=False,
         ),
         ToolDefinition(
             "symbols_list",
@@ -282,6 +283,7 @@ def register_listing_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
 何时使用：按名称发现函数、标签或外部符号时调用；只需函数集合时优先使用 functions_list。
 """,
             symbols_list,
+            mutates=False,
         ),
         ToolDefinition(
             "references_list",
@@ -293,6 +295,7 @@ def register_listing_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
 """,
             references_list,
             contract_version=2,
+            mutates=False,
         ),
         ToolDefinition(
             "strings_list",
@@ -303,6 +306,7 @@ def register_listing_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
 何时使用：从文本线索定位行为和引用时调用；搜索任意原始字节模式时不应使用本工具。
 """,
             strings_list,
+            mutates=False,
         ),
     )
     for definition in definitions:

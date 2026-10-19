@@ -43,6 +43,7 @@ def register_program_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
 何时使用：恢复上下文或选择目标程序时调用；需要程序架构详情时改用 program_info。
 """,
             program_list,
+            mutates=False,
         ),
         ToolDefinition(
             "program_info",
@@ -53,6 +54,7 @@ def register_program_tools(registry: ToolRegistry, workspace: ProgramWorkspace) 
 何时使用：开始分析时建立程序级上下文；只需寻找现有会话时改用 program_list。
 """,
             program_info,
+            mutates=False,
         ),
         ToolDefinition(
             "program_close",

@@ -336,6 +336,29 @@ def test_workspace_starts_jvm_once_and_owns_program_lifecycle(tmp_path: Path) ->
     assert fake.closed == [binary.resolve(), binary.resolve()]
 
 
+def test_workspace_resource_key_is_shared_across_sessions_of_one_binary(tmp_path: Path) -> None:
+    from ghidra_mcp.runtime import GhidraRuntime, ProgramWorkspace
+
+    install_dir = tmp_path / "ghidra"
+    install_dir.mkdir()
+    write_ghidra_version(install_dir)
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"sample")
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"other")
+    workspace = ProgramWorkspace(GhidraRuntime(install_dir, pyghidra_module=FakePyGhidra()))
+
+    first_id = workspace.open(binary)
+    second_id = workspace.open(binary)
+    other_id = workspace.open(other)
+
+    assert workspace.resource_key(first_id) == workspace.resource_key(second_id)
+    assert workspace.resource_key(first_id) != workspace.resource_key(other_id)
+    assert workspace.resource_key(first_id) == str(binary.resolve())
+    assert workspace.resource_key("missing") == "missing"
+    workspace.close_all()
+
+
 def test_runtime_bounds_analysis_and_reports_monitor_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

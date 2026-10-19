@@ -329,6 +329,27 @@ def test_input_root_uses_environment_dotenv_toml_precedence(tmp_path: Path) -> N
     assert settings.input_root == environment_root.resolve()
 
 
+def test_max_workers_is_configurable_but_bounded() -> None:
+    from ghidra_mcp.config import ConfigurationError, load_settings
+
+    default = load_settings(config_path=None, dotenv_path=None, environ={})
+    configured = load_settings(
+        config_path=None,
+        dotenv_path=None,
+        environ={"GHIDRA_MCP_MAX_WORKERS": "8"},
+    )
+
+    assert default.max_workers == 1
+    assert configured.max_workers == 8
+    for invalid in ("0", "65", "many"):
+        with pytest.raises(ConfigurationError, match="max_workers"):
+            load_settings(
+                config_path=None,
+                dotenv_path=None,
+                environ={"GHIDRA_MCP_MAX_WORKERS": invalid},
+            )
+
+
 def test_analysis_timeout_is_configurable_but_bounded() -> None:
     from ghidra_mcp.config import ConfigurationError, load_settings
 

@@ -125,6 +125,7 @@ def register_navigation_tools(registry: ToolRegistry, workspace: ProgramWorkspac
 何时使用：判断代码与数据布局或选择读取范围时调用；读取实际字节时改用 memory_read。
 """,
             memory_blocks_list,
+            mutates=False,
         ),
         ToolDefinition(
             "memory_read",
@@ -135,6 +136,7 @@ def register_navigation_tools(registry: ToolRegistry, workspace: ProgramWorkspac
 何时使用：需要原始字节、字符串线索、整数或指针候选时调用；只需查看内存布局时改用 memory_blocks_list，机器指令用 instructions_list。
 """,
             memory_read,
+            mutates=False,
         ),
         ToolDefinition(
             "functions_list",
@@ -145,6 +147,7 @@ def register_navigation_tools(registry: ToolRegistry, workspace: ProgramWorkspac
 何时使用：浏览函数集合或寻找候选目标时调用；已知函数内地址并需单项详情时改用 function_get。
 """,
             functions_list,
+            mutates=False,
         ),
         ToolDefinition(
             "function_get",
@@ -156,6 +159,7 @@ def register_navigation_tools(registry: ToolRegistry, workspace: ProgramWorkspac
             """,
             function_get,
             contract_version=2,
+            mutates=False,
         ),
     )
     for definition in definitions:

@@ -30,6 +30,20 @@ def test_service_builds_default_catalog_without_starting_jvm(tmp_path: Path) -> 
     assert fake.started is False
     assert service.settings is settings
     assert service.workspace.project_location == storage_root.resolve()
+    assert service.tool_executor.max_workers == settings.max_workers
+
+
+def test_service_threads_configured_max_workers_into_the_executor(tmp_path: Path) -> None:
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.service import create_service
+
+    install_dir = tmp_path / "ghidra"
+    install_dir.mkdir()
+    settings = Settings(install_dir=install_dir, max_workers=6)
+
+    service = create_service(settings, pyghidra_module=FakePyGhidra())
+
+    assert service.tool_executor.max_workers == 6
 
 
 def test_http_service_requires_input_root_even_for_direct_settings(tmp_path: Path) -> None:

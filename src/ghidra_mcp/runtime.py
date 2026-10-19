@@ -258,6 +258,16 @@ class ProgramWorkspace:
             except KeyError as error:
                 raise WorkspaceError(f"程序会话不存在：{program_id}") from error
 
+    def resource_key(self, program_id: str) -> str:
+        """返回会话底层程序的稳定资源键，使同一程序的不同会话写入互斥。
+
+        在事件循环线程上调用，因此不取 self._lock：close() 持锁期间会存盘，
+        取锁会让传输层卡住。单次 dict 读取在 GIL 下是原子的。
+        """
+
+        record = self._programs.get(program_id)
+        return str(record.path) if record is not None else program_id
+
     def list_open(self) -> list[dict[str, str]]:
         with self._lock:
             return [

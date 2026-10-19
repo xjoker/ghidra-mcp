@@ -102,6 +102,7 @@ Precedence is environment variables > `.env` > TOML > defaults. The default TOML
 |---|---:|---|
 | `GHIDRA_INSTALL_DIR` | none | Required Ghidra installation directory |
 | `GHIDRA_MCP_ANALYSIS_TIMEOUT_SECONDS` | `300` | Auto-analysis deadline, from 1 to 3600 seconds |
+| `GHIDRA_MCP_MAX_WORKERS` | `1` | JVM worker threads, from 1 to 64; read-only calls on a program run in parallel while writes stay serialized per program |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
 | `GHIDRA_MCP_HOST` | `127.0.0.1` | HTTP listen address |
 | `GHIDRA_MCP_PORT` | `8765` | HTTP port, from 1 to 65535 |
@@ -111,6 +112,8 @@ Precedence is environment variables > `.env` > TOML > defaults. The default TOML
 | `GHIDRA_MCP_AUTH_TOKEN` | none | Required HTTP token of at least 32 UTF-8 bytes |
 
 The public URL cannot contain a wildcard host, user information, query string, or path prefix. Secrets are accepted only from environment variables or an untracked `.env`; do not put real tokens in TOML, logs, shell history, or Git.
+
+With `GHIDRA_MCP_MAX_WORKERS > 1`, independent tool calls run on separate JVM worker threads. Read-only calls such as `decompile_function` on the same program run concurrently, while mutating calls take an exclusive per-program lock so Ghidra transactions and saves never overlap. Lifecycle calls (`program_open`, `program_close`) are keyed by the underlying binary, so concurrent sessions of one binary stay serialized. A call waits for its program lock before it takes a worker thread, so a busy program does not hold up calls on other programs; a waiting write is not overtaken by reads that arrive after it; and on exit the server lets running calls finish before it closes programs.
 
 ## Documentation
 

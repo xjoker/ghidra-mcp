@@ -29,6 +29,7 @@ def validate_http_auth_token(token: str | None) -> None:
 class Settings:
     install_dir: Path | None = None
     analysis_timeout_seconds: int = 300
+    max_workers: int = 1
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8765
@@ -40,7 +41,7 @@ class Settings:
 
 _ALLOWED_KEYS = {
     "ghidra": {"install_dir", "analysis_timeout_seconds"},
-    "server": {"transport", "host", "port", "public_url"},
+    "server": {"transport", "host", "port", "public_url", "max_workers"},
     "storage": {"root", "input_root"},
 }
 
@@ -183,6 +184,12 @@ def load_settings(
     )
     if not 1 <= analysis_timeout_seconds <= 3600:
         raise ConfigurationError("ghidra.analysis_timeout_seconds 必须在 1 到 3600 之间")
+    max_workers = _integer(
+        value("GHIDRA_MCP_MAX_WORKERS", server, "max_workers", 1),
+        key="server.max_workers",
+    )
+    if not 1 <= max_workers <= 64:
+        raise ConfigurationError("server.max_workers 必须在 1 到 64 之间")
     port = _integer(value("GHIDRA_MCP_PORT", server, "port", 8765), key="server.port")
     if not 1 <= port <= 65535:
         raise ConfigurationError("server.port 必须在 1 到 65535 之间")
@@ -194,6 +201,7 @@ def load_settings(
     return Settings(
         install_dir=install_dir,
         analysis_timeout_seconds=analysis_timeout_seconds,
+        max_workers=max_workers,
         transport=transport,
         host=str(value("GHIDRA_MCP_HOST", server, "host", "127.0.0.1")),
         port=port,

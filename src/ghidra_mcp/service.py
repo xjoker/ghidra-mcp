@@ -1,11 +1,13 @@
 """完整 MCP 服务对象的装配与退出清理。"""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .catalog import build_default_registry
+from .concurrency import program_resource_key
 from .config import (
     ConfigurationError,
     Settings,
@@ -27,10 +29,8 @@ class MCPService:
         try:
             self.app.run(transport=self.settings.transport)  # type: ignore[arg-type]
         finally:
-            try:
-                self.tool_executor.run_sync(self.workspace.close_all)
-            finally:
-                self.tool_executor.shutdown()
+            # 先排空仍在 worker 上运行的调用，再关闭程序，避免程序在读写途中被保存或释放。
+            self.tool_executor.close(self.workspace.close_all)
 
 
 def create_service(settings: Settings, *, pyghidra_module: Any | None = None) -> MCPService:
@@ -52,8 +52,9 @@ def create_service(settings: Settings, *, pyghidra_module: Any | None = None) ->
         project_location=settings.storage_root,
         input_root=settings.input_root,
     )
+    resource_namer = partial(program_resource_key, resolve_program=workspace.resource_key)
     registry = build_default_registry(workspace)
-    tool_executor = GhidraToolExecutor()
+    tool_executor = GhidraToolExecutor(max_workers=settings.max_workers)
     app = create_mcp_app(
         registry,
         host=settings.host,
@@ -61,6 +62,7 @@ def create_service(settings: Settings, *, pyghidra_module: Any | None = None) ->
         auth_token=settings.auth_token if settings.transport == "streamable-http" else None,
         public_url=public_url,
         tool_executor=tool_executor,
+        resource_namer=resource_namer,
     )
     return MCPService(
         settings=settings,

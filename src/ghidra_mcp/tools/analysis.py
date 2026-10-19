@@ -158,6 +158,7 @@ def register_analysis_tools(registry: ToolRegistry, workspace: ProgramWorkspace)
 何时使用：理解函数高层语义时调用；核对具体机器指令时改用 instructions_list。
 """,
             decompile_function,
+            mutates=False,
         ),
         ToolDefinition(
             "call_graph",
@@ -168,6 +169,7 @@ def register_analysis_tools(registry: ToolRegistry, workspace: ProgramWorkspace)
 何时使用：定位调用关系和影响范围时调用；分析函数内部跳转结构时改用 control_flow_graph。
 """,
             call_graph,
+            mutates=False,
         ),
         ToolDefinition(
             "control_flow_graph",
@@ -179,6 +181,7 @@ def register_analysis_tools(registry: ToolRegistry, workspace: ProgramWorkspace)
 """,
             control_flow_graph,
             contract_version=2,
+            mutates=False,
         ),
     )
     for definition in definitions:

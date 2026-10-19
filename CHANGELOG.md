@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The error returned to MCP clients when the configured Ghidra is older than the minimum supported version no longer includes the absolute Ghidra installation directory; it reports only the detected version, the minimum version, the reason, and upgrade guidance. The installation directory is written to the server log (logger `ghidra_mcp.runtime`) instead, so remote Streamable HTTP clients no longer learn host filesystem paths from this error.
+
 ## 20261019.2
 
 - **Breaking change for self-hosted installations:** raised the minimum supported Ghidra version from 12.1.2 to 12.1.3. `ghidra-mcp` now refuses to start the JVM against Ghidra 12.1.2 or older and reports the detected version, the installation directory, the minimum version, and the reason. Ghidra 12.1.3 fixed a potential path-traversal vulnerability when importing XML `*.bytes` files (GP-7064) and an ELF importer regression introduced in 12.1.2 that could fail when processing the dynamic GNU hash table and symbol table (GP-7061). Upgrade Ghidra and point `GHIDRA_INSTALL_DIR` at the new installation before upgrading `ghidra-mcp`.

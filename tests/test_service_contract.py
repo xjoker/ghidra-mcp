@@ -137,3 +137,52 @@ def test_http_service_requires_public_url_even_for_direct_settings(tmp_path: Pat
 
     with pytest.raises(ConfigurationError, match="GHIDRA_MCP_PUBLIC_URL"):
         create_service(settings, pyghidra_module=FakePyGhidra())
+
+
+def test_too_old_ghidra_error_reaches_mcp_client_without_install_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.service import create_service
+
+    install_dir = tmp_path / "private-host-location" / "ghidra_12.1.2_PUBLIC"
+    properties = install_dir / "Ghidra" / "application.properties"
+    properties.parent.mkdir(parents=True)
+    properties.write_text("application.version=12.1.2\n", encoding="utf-8")
+    binary = tmp_path / "inputs" / "sample.so"
+    binary.parent.mkdir()
+    binary.write_bytes(b"\x7fELF")
+    fake = FakePyGhidra()
+    service = create_service(
+        Settings(install_dir=install_dir, storage_root=tmp_path / "projects"),
+        pyghidra_module=fake,
+    )
+
+    async def call_program_open() -> object:
+        async with create_connected_server_and_client_session(service.app._mcp_server) as client:
+            return await client.call_tool(
+                "program_open", {"binary_path": str(binary), "analyze": False}
+            )
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="ghidra_mcp.runtime"):
+            result = asyncio.run(call_program_open())
+    finally:
+        service.tool_executor.close(service.workspace.close_all)
+
+    assert result.isError is True
+    client_text = "\n".join(getattr(item, "text", "") for item in result.content)
+    assert "Ghidra 12.1.2 低于最低支持版本 12.1.3" in client_text
+    assert "GHIDRA_INSTALL_DIR" in client_text
+    assert "private-host-location" not in client_text
+    assert str(install_dir.resolve()) not in client_text
+    assert fake.started is False
+    assert any(
+        str(install_dir.resolve()) in record.getMessage()
+        for record in caplog.records
+        if record.name == "ghidra_mcp.runtime"
+    )

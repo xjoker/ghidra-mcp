@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
+import logging
 from pathlib import Path
 import re
 import sys
@@ -13,6 +14,9 @@ from time import monotonic
 from types import ModuleType
 from typing import Any, Iterator
 from uuid import uuid4
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WorkspaceError(RuntimeError):
@@ -82,10 +86,19 @@ class GhidraRuntime:
                     raise WorkspaceError(f"Ghidra 安装目录不存在：{self.install_dir}")
                 version = _read_ghidra_version(self.install_dir)
                 if version < _MINIMUM_GHIDRA_VERSION:
+                    detected = _format_version(version)
                     minimum = _format_version(_MINIMUM_GHIDRA_VERSION)
+                    # 绝对安装路径只写服务端日志；返回给 MCP 客户端的错误只含版本与升级说明，
+                    # 避免通过 Streamable HTTP 向远程客户端暴露宿主机路径。
+                    _LOGGER.error(
+                        "拒绝启动 JVM：%s 中的 Ghidra %s 低于最低支持版本 %s",
+                        self.install_dir,
+                        detected,
+                        minimum,
+                    )
                     raise WorkspaceError(
-                        f"Ghidra {_format_version(version)}（{self.install_dir}）"
-                        f"低于最低支持版本 {minimum}：{_MINIMUM_GHIDRA_VERSION_REASON}。"
+                        f"Ghidra {detected} 低于最低支持版本 {minimum}："
+                        f"{_MINIMUM_GHIDRA_VERSION_REASON}。"
                         f"请安装 Ghidra {minimum} 或更高版本，"
                         "并将 GHIDRA_INSTALL_DIR 指向新的安装目录"
                     )

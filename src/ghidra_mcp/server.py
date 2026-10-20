@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import subprocess
 from threading import Condition
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -35,19 +35,71 @@ _LOGGER = logging.getLogger(__name__)
 # Error types whose text ghidra-mcp writes itself. Each of their messages is audited to be
 # free of host paths and may deliberately echo a value the client supplied (for example a
 # binary path or a Ghidra data type path), so their text reaches the client unchanged.
+# tests/test_client_error_paths_contract.py checks every place that builds one of them.
 _CLIENT_SAFE_ERRORS = (WorkspaceError, ToolInputError)
 
-# Something that looks like an absolute host path: a POSIX "/x" that does not continue an
-# ASCII word or a relative "./" / "../" segment (this also covers "file:///x" URLs), a Windows
-# drive "C:\" or "C:/", or a UNC "\\server" prefix.
-_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.])/(?=[^\s/])|(?<![A-Za-z0-9])[A-Za-z]:[\\/]|\\\\")
+# Something that looks like an absolute host path:
+# - a POSIX "/x" that does not continue an ASCII word or a relative "./" / "../" segment
+#   (this also covers "file:///x" URLs);
+# - a well-known root directory ("/home/", "/srv", "\Users\", ...) wherever it appears,
+#   including right after an ASCII letter, digit, "_" or "." ("projectdir/srv/x");
+# - a Windows drive "C:\" or "C:/", a UNC "\\server" prefix, or a root-relative
+#   "\Users\x" with no drive letter;
+# - a home directory "~/x" or "~user/x".
+# It is deliberately conservative: http(s) URLs and Ghidra category paths such as
+# "/Demangler/foo" match too, so foreign errors that contain them are hidden as well.
+_WELL_KNOWN_ROOTS = (
+    "home|Users|tmp|var|opt|srv|data|workspace|root|mnt|private|etc|usr|Volumes|media"
+)
+_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.])/(?=[^\s/])"
+    rf"|[/\\](?:{_WELL_KNOWN_ROOTS})(?![A-Za-z0-9_.-])"
+    r"|(?<![A-Za-z0-9])[A-Za-z]:[\\/]"
+    r"|\\\\"
+    r"|(?<![A-Za-z0-9_\\])\\(?=[^\s\\])"
+    r"|(?<![A-Za-z0-9_.])~[A-Za-z0-9_.-]*[/\\]"
+)
+
+
+def _host_path_forms(paths: Iterable[Path | str | None]) -> tuple[str, ...]:
+    """Return the absolute spellings of the server's configured roots to look for in error text.
+
+    Each root is taken as configured (when absolute), made absolute without resolving
+    symlinks, and fully resolved, since Ghidra and the OS may report any of them. Relative
+    spellings and the filesystem root itself are skipped: they would match ordinary text.
+    """
+
+    forms: set[str] = set()
+    for path in paths:
+        if path is None:
+            continue
+        configured = Path(path)
+        candidates = [os.path.abspath(configured)]
+        if configured.is_absolute():
+            candidates.append(str(configured))
+        try:
+            candidates.append(str(configured.resolve()))
+        except (OSError, RuntimeError):
+            pass
+        for candidate in candidates:
+            candidate = candidate.rstrip("/\\")
+            if candidate and Path(candidate) != Path(Path(candidate).anchor):
+                forms.add(candidate)
+    # Longest first, so the log names the most specific match.
+    return tuple(sorted(forms, key=len, reverse=True))
+
+
+def _shows_host_path(text: str, host_paths: tuple[str, ...]) -> bool:
+    return _ABSOLUTE_PATH.search(text) is not None or any(path in text for path in host_paths)
 
 
 class _ClientSafeToolError(RuntimeError):
     """Replaces an error whose text would show host paths to the MCP client."""
 
 
-def _client_safe_error(tool_name: str, error: Exception) -> Exception | None:
+def _client_safe_error(
+    tool_name: str, error: Exception, host_paths: tuple[str, ...] = ()
+) -> Exception | None:
     """Return a path-free stand-in for ``error``, or None when its text may reach the client.
 
     FastMCP returns ``str(error)`` of any exception a tool raises to the client, over stdio
@@ -55,12 +107,14 @@ def _client_safe_error(tool_name: str, error: Exception) -> Exception | None:
     from Ghidra, ``OSError``, PyGhidra start-up failures, ``Path.resolve`` symlink loops, ...)
     can carry install, project or input paths. Such text is logged server-side in full and
     the client only gets the error type plus, for ``OSError``, its path-free reason.
+    ``host_paths`` are the server's configured roots (see ``_host_path_forms``); text that
+    contains one is hidden even when the pattern above does not match it.
     """
 
     if isinstance(error, _CLIENT_SAFE_ERRORS):
         return None
     text = str(error)
-    if not _ABSOLUTE_PATH.search(text):
+    if not _shows_host_path(text, host_paths):
         return None
     _LOGGER.error(
         "工具 %s 失败，错误信息含服务端路径，已对客户端隐去：%s",
@@ -71,7 +125,7 @@ def _client_safe_error(tool_name: str, error: Exception) -> Exception | None:
     reason = ""
     if isinstance(error, OSError) and error.strerror:
         strerror = str(error.strerror)
-        if not _ABSOLUTE_PATH.search(strerror):
+        if not _shows_host_path(strerror, host_paths):
             reason = f"{strerror}；"
     return _ClientSafeToolError(
         f"{type(error).__name__}：{reason}错误详情包含服务端路径，已对客户端隐去，完整信息见服务端日志"
@@ -185,7 +239,12 @@ class GhidraToolExecutor:
                 self._state.notify_all()
 
 
-def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any) -> Any:
+def _async_handler(
+    tool: ToolDefinition,
+    executor: GhidraToolExecutor,
+    resource_namer: Any,
+    host_paths: tuple[str, ...] = (),
+) -> Any:
     @wraps(tool.handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
         try:
@@ -203,7 +262,7 @@ def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_
                 exclusive=tool.mutates,
             )
         except Exception as error:
-            replacement = _client_safe_error(tool.name, error)
+            replacement = _client_safe_error(tool.name, error, host_paths)
             if replacement is None:
                 raise
             raise replacement from error
@@ -283,6 +342,7 @@ def create_mcp_app(
     tool_executor: GhidraToolExecutor | None = None,
     max_workers: int = 1,
     resource_namer: Any = None,
+    host_paths: Iterable[Path | str | None] = (),
 ) -> FastMCP:
     """绑定工具注册表到 FastMCP。
 
@@ -290,6 +350,10 @@ def create_mcp_app(
     把 program_id 映射到与 binary_path 相同的底层二进制键（例如
     ``partial(program_resource_key, resolve_program=workspace.resource_key)``）；
     否则同一二进制的各会话不会互斥。默认 CLI 路径走 ``create_service``，已传入该映射。
+
+    host_paths are the server's configured roots (install, storage and input root). A
+    foreign error whose text contains one of them is hidden from the client even when it
+    does not look like an absolute path; ``create_service`` passes them.
     """
 
     auth = None
@@ -319,12 +383,13 @@ def create_mcp_app(
             "max_workers 大于 1 时必须提供 resource_namer，以便将同一二进制的各会话映射到同一闸门"
         )
     namer = resource_namer or program_resource_key
+    known_paths = _host_path_forms(host_paths)
     for tool in registry.enabled_tools():
         app.tool(
             name=tool.name,
             description=tool.description,
             annotations=tool.annotations,
-        )(_async_handler(tool, executor, namer))
+        )(_async_handler(tool, executor, namer, known_paths))
 
     health_payload = {
         "status": "ok",

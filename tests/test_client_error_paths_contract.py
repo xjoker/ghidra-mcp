@@ -25,6 +25,7 @@ transaction errors, executor shutdown, FastMCP argument validation.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from contextlib import contextmanager
 import json
@@ -539,9 +540,24 @@ HOST_PATH_ERRORS = {
         r"C:\Users\private",
     ),
     "unc-share": (
-        RuntimeError(r"Unable to open \\fileserver\private\x.gpr"),
+        RuntimeError(r"Unable to open \\fileserver\ghidra-share\x.gpr"),
         "RuntimeError：错误详情包含服务端路径",
-        r"\\fileserver\private",
+        r"\\fileserver\ghidra-share",
+    ),
+    "oserror-strerror-with-path": (
+        OSError(5, "I/O error on /srv/private/projects/x.gpr"),
+        "OSError：错误详情包含服务端路径",
+        "/srv/private/projects",
+    ),
+    "windows-drive-root-only": (
+        RuntimeError("cannot write to C:\\"),
+        "RuntimeError：错误详情包含服务端路径",
+        "C:\\",
+    ),
+    "windows-drive-unknown-root": (
+        RuntimeError(r"Unable to open D:\ghidra-projects\x.gpr"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"D:\ghidra-projects",
     ),
     "path-after-cjk": (
         TimeoutError("等待锁超时：/var/private/lock"),
@@ -552,6 +568,65 @@ HOST_PATH_ERRORS = {
         RuntimeError("无法写入项目目录/srv/private/projects"),
         "RuntimeError：错误详情包含服务端路径",
         "/srv/private/projects",
+    ),
+    # PR #22 review L1: a well-known root right after an ASCII letter, digit, "_" or ".".
+    "path-after-ascii-letter": (
+        RuntimeError("cannot open projectdir/srv/private/projects/x.gpr"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/srv/private/projects",
+    ),
+    "path-after-dot": (
+        RuntimeError("see.../home/private/.ghidra/prefs"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/home/private",
+    ),
+    "path-after-digit": (
+        RuntimeError("v12/opt/private/ghidra"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/opt/private",
+    ),
+    "path-after-underscore": (
+        RuntimeError("tmp_dir_/tmp/private/lock"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/tmp/private",
+    ),
+    "windows-users-after-letter": (
+        RuntimeError(r"profile\Users\private\ghidra"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\Users\private",
+    ),
+    # PR #22 review L2: Windows root-relative paths and ~user home directories.
+    "windows-root-relative": (
+        RuntimeError(r"Unable to open \Users\private\x.gpr"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\Users\private",
+    ),
+    "windows-root-relative-unknown-root": (
+        RuntimeError(r"Unable to open \ghidra-projects\alice\x.gpr"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\ghidra-projects\alice",
+    ),
+    "tilde-user": (
+        RuntimeError("cannot read ~alice/ghidra-notes/prefs"),
+        "RuntimeError：错误详情包含服务端路径",
+        "~alice/ghidra-notes",
+    ),
+    "tilde-user-windows-separator": (
+        RuntimeError(r"cannot read ~alice\ghidra-notes\prefs"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"~alice\ghidra-notes",
+    ),
+    # PR #22 review L3: deliberately conservative, URLs and Ghidra category paths in
+    # foreign errors are hidden too (see CHANGELOG).
+    "http-url-is-hidden-too": (
+        RuntimeError("fetch failed: https://example.invalid/private/x"),
+        "RuntimeError：错误详情包含服务端路径",
+        "example.invalid/private",
+    ),
+    "ghidra-category-path-is-hidden-too": (
+        RuntimeError("data type conflict in /Demangler/private_type"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/Demangler/private_type",
     ),
 }
 
@@ -614,6 +689,9 @@ PASS_THROUGH_ERRORS = {
     "path-free-runtime-error": RuntimeError("反编译失败：bad instruction at ram:00401000"),
     "timeout": TimeoutError("Ghidra 自动分析超过 300 秒"),
     "relative-path": RuntimeError("missing Ghidra/application.properties"),
+    # Relative paths that merely contain a well-known root name as a word are kept.
+    "relative-path-with-root-word": RuntimeError("missing data_files/homework/variables.txt"),
+    "plain-slash-words": RuntimeError("read/write and input/output failed"),
 }
 
 
@@ -760,3 +838,225 @@ def test_streamable_http_client_sees_the_same_path_free_error(
     )
     assert_path_free(client_text, install_dir.resolve(), input_root.resolve(), tmp_path)
     assert any(str(install_dir.resolve()) in line for line in logged(caplog, "ghidra_mcp.runtime"))
+
+
+# ---------------------------------------------------------------- configured roots (review L1)
+
+
+def test_host_path_forms_cover_configured_absolute_and_resolved_spellings(tmp_path: Path) -> None:
+    from ghidra_mcp.server import _host_path_forms
+
+    real = tmp_path / "real-root"
+    real.mkdir()
+    link = tmp_path / "link-root"
+    link.symlink_to(real)
+
+    # A symlinked root: as configured (absolute) and resolved through the link.
+    assert set(_host_path_forms([link])) == {str(link), str(real)}
+    forms = _host_path_forms([Path("/"), None, f"{tmp_path}/a/../real-root/"])
+    # The spelling as configured is kept even when it is not normalised, next to the
+    # normalised one.
+    assert f"{tmp_path}/a/../real-root" in forms
+    assert str(real) in forms
+    assert "/" not in forms and "" not in forms
+
+
+def test_host_path_forms_skip_relative_spellings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ghidra_mcp.server import _host_path_forms
+
+    monkeypatch.chdir(tmp_path)
+    forms = _host_path_forms([Path("data/projects")])
+
+    assert "data/projects" not in forms
+    assert forms == (str(tmp_path / "data" / "projects"),)
+
+
+@pytest.mark.parametrize("spelling", ["configured", "resolved"])
+def test_foreign_error_naming_a_configured_root_is_hidden_without_the_pattern(
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The configured-root check stands on its own: with the pattern disabled, an error that
+    # names the storage root (as configured, through a symlink, or resolved) is still hidden.
+    import ghidra_mcp.server as server
+
+    monkeypatch.setattr(server, "_ABSOLUTE_PATH", re.compile(r"(?!x)x"))
+    real = tmp_path / "zz-real-projects"
+    real.mkdir()
+    link = tmp_path / "zz-link-projects"
+    link.symlink_to(real)
+    named = link if spelling == "configured" else real
+    error = RuntimeError(f"Unable to lock project!project{named}/x.rep")
+
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.service import create_service
+
+    install_dir = tmp_path / "private-host-location" / "ghidra"
+    write_ghidra_version(install_dir)
+    (tmp_path / "sample.bin").write_bytes(b"sample")
+    monkeypatch.chdir(tmp_path)
+    service = create_service(
+        Settings(install_dir=install_dir, storage_root=link),
+        pyghidra_module=FakePyGhidra(open_error=error),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="ghidra_mcp.server"):
+        (result,) = call_tools(service, ("program_open", {"binary_path": "sample.bin"}))
+
+    assert result.isError is True
+    client_text = text_of(result)
+    assert "RuntimeError：错误详情包含服务端路径" in client_text
+    assert str(named) not in client_text and "zz-" not in client_text
+    assert any(str(named) in line for line in logged(caplog, "ghidra_mcp.server"))
+
+
+@pytest.mark.parametrize("root", ["install", "storage", "input"])
+def test_create_service_passes_every_configured_root_to_the_guard(
+    root: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ghidra_mcp.server as server
+
+    monkeypatch.setattr(server, "_ABSOLUTE_PATH", re.compile(r"(?!x)x"))
+    install_dir = tmp_path / "zz-install"
+    write_ghidra_version(install_dir)
+    storage = tmp_path / "zz-storage"
+    input_root = tmp_path / "zz-input"
+    input_root.mkdir()
+    (input_root / "sample.bin").write_bytes(b"sample")
+    named = {"install": install_dir, "storage": storage, "input": input_root}[root]
+    error = RuntimeError(f"failed near x{named}/x")
+
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.service import create_service
+
+    service = create_service(
+        Settings(install_dir=install_dir, storage_root=storage, input_root=input_root),
+        pyghidra_module=FakePyGhidra(open_error=error),
+    )
+    (result,) = call_tools(
+        service, ("program_open", {"binary_path": str(input_root / "sample.bin")})
+    )
+
+    assert result.isError is True
+    assert "错误详情包含服务端路径" in text_of(result)
+    assert str(named) not in text_of(result)
+
+
+# ------------------------------------------- pass-through error types (review L4, no regression)
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "ghidra_mcp"
+PASS_THROUGH_TYPES = {"WorkspaceError", "ToolInputError"}
+
+# Every value interpolated into a WorkspaceError / ToolInputError message, with why it may
+# reach the client. A new interpolation fails the test below until it is reviewed and added.
+AUDITED_INTERPOLATIONS = {
+    "address": "Ghidra address or the client's address argument",
+    "next_address": "Ghidra address",
+    "entry_point": "Ghidra address",
+    "value": "the client's argument value",
+    "path": "the client's data type path argument",
+    "program_id": "the client's program_id argument",
+    "binary_path": "the client's binary_path, normalised by pathlib, never resolved",
+    "detected": "detected Ghidra version string",
+    "minimum": "minimum Ghidra version string",
+    "_MINIMUM_GHIDRA_VERSION_REASON": "constant text",
+}
+
+# Names that hold host paths. They may never appear in a pass-through message, audited or not.
+HOST_PATH_NAMES = re.compile(
+    r"install_dir|project_location|storage_root|input_root|location|properties|binary\b"
+    r"|resolve|cwd|home|abspath|realpath|__file__|launcher|record|settings"
+)
+
+
+def _pass_through_sites() -> list[tuple[str, int, ast.expr]]:
+    sites = []
+    for source in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name not in PASS_THROUGH_TYPES:
+                continue
+            where = f"{source.relative_to(SRC)}:{node.lineno}"
+            arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+            assert arguments, f"{where}: {name}() without a message"
+            sites.extend((where, node.lineno, argument) for argument in arguments)
+    return sites
+
+
+def test_pass_through_error_messages_only_interpolate_audited_client_values() -> None:
+    sites = _pass_through_sites()
+    assert len(sites) >= 50, len(sites)
+    problems = []
+    for where, _, argument in sites:
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            if HOST_PATH_NAMES.search(argument.value) and "/" in argument.value:
+                problems.append(f"{where}: constant message looks like it names a host path")
+            continue
+        if not isinstance(argument, ast.JoinedStr):
+            problems.append(
+                f"{where}: message is not a literal or f-string: {ast.unparse(argument)}"
+            )
+            continue
+        for part in argument.values:
+            if not isinstance(part, ast.FormattedValue):
+                continue
+            expression = ast.unparse(part.value)
+            if HOST_PATH_NAMES.search(expression):
+                problems.append(f"{where}: interpolates a host path: {{{expression}}}")
+            elif expression not in AUDITED_INTERPOLATIONS:
+                problems.append(f"{where}: unaudited interpolation {{{expression}}}")
+    assert problems == []
+
+
+def test_pass_through_error_types_have_no_subclasses_and_stay_the_only_trusted_ones() -> None:
+    from ghidra_mcp import server
+
+    assert {error.__name__ for error in server._CLIENT_SAFE_ERRORS} == PASS_THROUGH_TYPES
+    for source in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name not in PASS_THROUGH_TYPES:
+                bases = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
+                assert not bases & PASS_THROUGH_TYPES, f"{source.name}: {node.name}"
+
+
+def test_pass_through_errors_never_show_configured_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Sentinel roots: every pass-through error a client can trigger before Ghidra runs must
+    # leave them out (the client's own relative input is all that may be echoed).
+    install_dir = tmp_path / "sentinel-install"
+    write_ghidra_version(install_dir)
+    storage = tmp_path / "sentinel-storage"
+    input_root = tmp_path / "sentinel-input"
+    (input_root / "dir").mkdir(parents=True)
+    monkeypatch.chdir(input_root)
+
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.service import create_service
+
+    service = create_service(
+        Settings(install_dir=install_dir, storage_root=storage, input_root=input_root),
+        pyghidra_module=FakePyGhidra(),
+    )
+    results = call_tools(
+        service,
+        ("program_open", {"binary_path": "missing.bin"}),
+        ("program_open", {"binary_path": "dir"}),
+        ("program_open", {"binary_path": "../outside.bin"}),
+        ("program_open", {"binary_path": str(tmp_path / "outside.bin")}),
+        ("program_info", {"program_id": "no-such-session"}),
+        ("program_close", {"program_id": "no-such-session"}),
+    )
+
+    for result in results:
+        assert result.isError is True
+        client_text = text_of(result)
+        for root in (install_dir, storage, input_root, tmp_path, Path.cwd()):
+            assert str(root) not in client_text, (root, client_text)
+        assert "sentinel" not in client_text, client_text

@@ -231,6 +231,16 @@ def create_service(settings: Settings, *, pyghidra_module: Any | None = None) ->
         public_url=public_url,
         tool_executor=tool_executor,
         resource_namer=resource_namer,
+        # Configured roots as given and as resolved: foreign errors naming any of them are
+        # hidden from clients even when the text does not look like an absolute path.
+        host_paths=(
+            settings.install_dir,
+            runtime.install_dir,
+            settings.storage_root,
+            workspace.project_location,
+            settings.input_root,
+            workspace.input_root,
+        ),
     )
     return MCPService(
         settings=settings,

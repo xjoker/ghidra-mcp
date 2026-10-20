@@ -3,7 +3,7 @@
 The workflow is parsed with PyYAML and its scripts are executed locally: the version
 check runs against a fake OCI registry, the re-read step runs with bash the way
 GitHub Actions does, and every publish-job script must match a hand-frozen,
-default-deny allowlist line for line (see PUBLISH_RUN_LINES).
+default-deny allowlist physical line for physical line (see PUBLISH_RUN_LINES).
 """
 
 import ast
@@ -585,11 +585,23 @@ def test_publish_checks_version_before_login_and_build() -> None:
 # ---------------------------------------------------------------------------
 # Publish job: default-deny, exact-match allowlist (SAF-50).
 #
-# Every bash `run:` script in the publish job must consist of exactly the logical
+# Every bash `run:` script in the publish job must consist of exactly the physical
 # lines frozen below, in the same order, for the same step. Nothing is parsed as
-# shell: a line either equals a frozen line byte for byte or the test fails. The
-# text compared is the string yaml.safe_load returns, i.e. what Actions hands to
-# bash; `${{ }}` expressions are compared literally.
+# shell and nothing is normalised: the script is split on "\n" and each piece must
+# equal the frozen line byte for byte, indentation, `\` continuations and the empty
+# piece after the final newline included. The ordered per-step comparison is
+# therefore the same as comparing the whole script string, while a failure still
+# names the offending line. The text compared is the string the YAML loader returns
+# (see _workflow), i.e. what Actions hands to bash; `${{ }}` expressions are
+# compared literally.
+#
+# Why physical lines rather than joined `\` continuations (SAF-50 R1): joining
+# `<blank>\<newline><blanks>` into one space mapped a continuation inserted inside a
+# quoted string or inside a `${{ }}` expression back onto the frozen line, although
+# bash (inside quotes) or Actions (inside `${{ }}`) see different text. Comparing
+# physical lines leaves no normalisation step to disagree with bash or Actions.
+# A per-step sha256 would be equally exact but would hide which line changed and
+# could not reject a foreign line by itself, so the readable table stays.
 #
 # These tables are hand-frozen on purpose. They are never regenerated from the
 # workflow at test time (that would make the test approve itself). Any change to
@@ -598,51 +610,67 @@ def test_publish_checks_version_before_login_and_build() -> None:
 # confirm the new text.
 # ---------------------------------------------------------------------------
 
+# A step whose script ends with a newline ends with "" (the text after it).
 PUBLISH_RUN_LINES: dict[str, tuple[str, ...]] = {
     "Re-read version and test outputs": (
         "VERSION=\"$(tr -d '\\r\\n' < VERSION)\"",
         '[[ "$VERSION" =~ ^[0-9]{8}\\.[1-9][0-9]*$ ]]',
         'if [[ "$GITHUB_REF_NAME" != "v$VERSION" || "$VERSION" != "$TESTED_VERSION" ]]; then',
-        'echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2',
-        "exit 1",
+        '  echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2',
+        "  exit 1",
         "fi",
         '[[ "$TESTED_SCHEMA" =~ ^[0-9a-f]{16}$ ]]',
         'echo "value=$VERSION" >> "$GITHUB_OUTPUT"',
         'echo "schema=$TESTED_SCHEMA" >> "$GITHUB_OUTPUT"',
+        "",
     ),
     "Refuse to overwrite a released version": (
-        'if INSPECT_ERROR="$(docker manifest inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" 2>&1)"; then',
-        'echo "Version tag already exists: ${IMAGE_NAME}:${{ steps.version.outputs.value }}" >&2',
-        "exit 1",
+        'if INSPECT_ERROR="$(docker manifest inspect \\',
+        '  "${IMAGE_NAME}:${{ steps.version.outputs.value }}" 2>&1)"; then',
+        '  echo "Version tag already exists: ${IMAGE_NAME}:${{ steps.version.outputs.value }}" >&2',
+        "  exit 1",
         "fi",
         "if ! grep -Eqi 'manifest unknown|not found' <<<\"$INSPECT_ERROR\"; then",
-        'echo "Could not prove that the version tag is unused:" >&2',
-        "printf '%s\\n' \"$INSPECT_ERROR\" >&2",
-        "exit 1",
+        '  echo "Could not prove that the version tag is unused:" >&2',
+        "  printf '%s\\n' \"$INSPECT_ERROR\" >&2",
+        "  exit 1",
         "fi",
+        "",
     ),
     "Verify the candidate digest": (
         'docker pull "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
         'TOKEN="$(openssl rand -hex 32)"',
-        'docker run -d --name ghidra-mcp-ci --network host -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+        "docker run -d --name ghidra-mcp-ci --network host \\",
+        "  -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 \\",
+        '  -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" \\',
+        '  "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
         'HEALTH=""',
         "for _ in $(seq 1 30); do",
-        'HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
-        'if [ -n "$HEALTH" ]; then',
-        'python3 -c \'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}\' "${{ steps.version.outputs.value }}" "${{ github.sha }}" "${{ steps.version.outputs.schema }}" "$HEALTH"',
-        "break",
-        "fi",
-        "sleep 2",
+        '  HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"',
+        '  if [ -n "$HEALTH" ]; then',
+        '    python3 -c \'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}\' \\',
+        '      "${{ steps.version.outputs.value }}" "${{ github.sha }}" \\',
+        '      "${{ steps.version.outputs.schema }}" "$HEALTH"',
+        "    break",
+        "  fi",
+        "  sleep 2",
         "done",
         'if [ -z "$HEALTH" ]; then',
-        "docker logs ghidra-mcp-ci",
-        "exit 1",
+        "  docker logs ghidra-mcp-ci",
+        "  exit 1",
         "fi",
+        "",
     ),
     "Promote verified digest": (
-        'docker buildx imagetools create --tag "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
-        'VERSION_DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.version.outputs.value }}" --format \'{{json .Manifest.Digest}}\' | tr -d \'"\')"',
+        "docker buildx imagetools create \\",
+        '  --tag "${IMAGE_NAME}:${{ steps.version.outputs.value }}" \\',
+        '  --tag "${IMAGE_NAME}:latest" \\',
+        '  "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"',
+        'VERSION_DIGEST="$(docker buildx imagetools inspect \\',
+        '  "${IMAGE_NAME}:${{ steps.version.outputs.value }}" \\',
+        "  --format '{{json .Manifest.Digest}}' | tr -d '\"')\"",
         'test "$VERSION_DIGEST" = "${{ steps.image.outputs.digest }}"',
+        "",
     ),
     "Remove verification container": ("docker rm -f ghidra-mcp-ci 2>/dev/null || true",),
 }
@@ -702,15 +730,11 @@ PUBLISH_JOB_KEYS = {"name", "needs", "runs-on", "timeout-minutes", "permissions"
 # character outside printable ASCII apart from the newline (tab, CR, other
 # control characters, non-ASCII). None of them occur in the frozen lines.
 FORBIDDEN_CHARACTER = re.compile(r"[^\x20-\x7e\n]|#")
-# A continuation must have a blank before the backslash: bash deletes `\`+newline,
-# so `a\<newline>b` is the single word `ab`, while joining would read `a b`.
-LINE_CONTINUATION = re.compile(r"[ \t]+\\\n[ \t]*")
 
 
-def _logical_lines(script: str) -> tuple[str, ...]:
-    """The only normalisation: join `\\` continuations, strip lines, drop empty ones."""
-    joined = LINE_CONTINUATION.sub(" ", script)
-    return tuple(line.strip() for line in joined.split("\n") if line.strip())
+def _physical_lines(script: str) -> tuple[str, ...]:
+    """Split on "\\n" only: nothing is joined, stripped or dropped."""
+    return tuple(script.split("\n"))
 
 
 def _same(actual: object, expected: object) -> bool:
@@ -730,7 +754,7 @@ def _line_problems(script: str) -> list[str]:
         return [f"forbidden character(s) {', '.join(bad)}"]
     return [
         f"not allowlisted: {line}"
-        for line in _logical_lines(script)
+        for line in _physical_lines(script)
         if line not in ALL_PUBLISH_RUN_LINES
     ]
 
@@ -754,7 +778,7 @@ def _bash_run_problems(name: str, run: str) -> list[str]:
     if bad:
         return [f"{name}: forbidden character(s) {', '.join(bad)}"]
     frozen = PUBLISH_RUN_LINES[name]
-    lines = _logical_lines(run)
+    lines = _physical_lines(run)
     problems = [
         f"{name}: line {index} is not allowlisted for this step: {line}"
         for index, line in enumerate(lines)
@@ -814,11 +838,11 @@ def test_version_check_script_matches_the_pinned_hash() -> None:
 
 
 def test_publish_allowlist_tables_are_consistent() -> None:
-    # Frozen lines are already normalised and contain no forbidden character, and
+    # Frozen lines are single physical lines without a forbidden character, and
     # the run steps are exactly the frozen bash steps plus the version check.
     for lines in PUBLISH_RUN_LINES.values():
         for line in lines:
-            assert _logical_lines(line) == (line,)
+            assert _physical_lines(line) == (line,)
             assert not FORBIDDEN_CHARACTER.search(line), line
     assert set(PUBLISH_RUN_STEP_FIELDS) == set(PUBLISH_RUN_LINES) | {VERSION_CHECK}
     for fields in PUBLISH_RUN_STEP_FIELDS.values():
@@ -826,8 +850,10 @@ def test_publish_allowlist_tables_are_consistent() -> None:
     assert [name for name in PUBLISH_STEP_NAMES if name in PUBLISH_RUN_STEP_FIELDS] == list(
         PUBLISH_RUN_STEP_FIELDS
     )
-    assert sum(map(len, PUBLISH_RUN_LINES.values())) == 38
-    assert len(ALL_PUBLISH_RUN_LINES) == 31
+    # 49 non-empty physical lines plus the "" after the final newline of 4 steps.
+    assert sum(map(len, PUBLISH_RUN_LINES.values())) == 53
+    assert sum(1 for lines in PUBLISH_RUN_LINES.values() for line in lines if line) == 49
+    assert len(ALL_PUBLISH_RUN_LINES) == 43
 
 
 def test_publish_job_steps_use_only_pinned_actions() -> None:
@@ -1146,25 +1172,32 @@ REVIEW_PROBES: dict[str, str] = {
 }
 
 
-VERBATIM_PRODUCTION_PROBES = {"r3-p2-printf-prod", "r3-p4-prod"}
+# Under the SAF-50 logical-line table these two probes were accepted as verbatim
+# production lines. With physical lines neither is a line of the workflow any more:
+# the printf line is indented inside its `if`, and the health check spans three
+# physical lines joined by `\` continuations.
+FORMERLY_VERBATIM_PRODUCTION_PROBES = {"r3-p2-printf-prod", "r3-p4-prod"}
 
 
 @pytest.mark.parametrize(
-    "script",
-    [
-        pytest.param(script, id=probe)
-        for probe, script in REVIEW_PROBES.items()
-        if probe not in VERBATIM_PRODUCTION_PROBES
-    ],
+    "script", [pytest.param(script, id=probe) for probe, script in REVIEW_PROBES.items()]
 )
 def test_publish_line_allowlist_rejects_review_probes(script: str) -> None:
     assert _line_problems(script)
 
 
-def test_publish_line_allowlist_accepts_verbatim_production_probes() -> None:
+def test_publish_line_allowlist_accepts_only_verbatim_physical_lines() -> None:
     accepted = {probe for probe, script in REVIEW_PROBES.items() if not _line_problems(script)}
-    assert accepted == VERBATIM_PRODUCTION_PROBES
+    assert accepted == set()
     assert len(REVIEW_PROBES) == 256
+    # Positive controls: every frozen script, and the formerly verbatim printf probe
+    # once it carries its production indentation.
+    for lines in PUBLISH_RUN_LINES.values():
+        assert _line_problems("\n".join(lines)) == []
+    assert _line_problems("  " + REVIEW_PROBES["r3-p2-printf-prod"]) == []
+    assert all(
+        _line_problems(REVIEW_PROBES[probe]) for probe in FORMERLY_VERBATIM_PRODUCTION_PROBES
+    )
 
 
 # The bypass classes that kept reappearing under the shlex-based checker. None of
@@ -1314,13 +1347,13 @@ def _publish_step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _edit_lines(name: str, edit: Any) -> Any:
-    """A mutation that rewrites the logical lines of one bash step."""
+    """A mutation that rewrites the physical lines of one bash step."""
 
     def mutate(workflow: dict[str, Any]) -> None:
         step = _publish_step(workflow, name)
-        lines = list(_logical_lines(step["run"]))
+        lines = list(_physical_lines(step["run"]))
         edit(lines)
-        step["run"] = "\n".join(lines) + "\n"
+        step["run"] = "\n".join(lines)
 
     return mutate
 
@@ -1338,8 +1371,11 @@ PROMOTE_STEP = "Promote verified digest"
 REREAD = "Re-read version and test outputs"
 REMOVE = "Remove verification container"
 REFUSE = "Refuse to overwrite a released version"
-PROMOTE_LINE = PUBLISH_RUN_LINES[PROMOTE_STEP][0]
-HEALTH_LINE = PUBLISH_RUN_LINES[VERIFY][7]
+PROMOTE_COMMAND = PUBLISH_RUN_LINES[PROMOTE_STEP][0:4]
+DIGEST_TEST_LINE = PUBLISH_RUN_LINES[PROMOTE_STEP][7]
+HEALTH_COMMAND = PUBLISH_RUN_LINES[VERIFY][10:13]
+HEALTH_LINE = HEALTH_COMMAND[0]
+BREAK_LINE = "    break"
 
 
 def _steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1361,18 +1397,30 @@ def _swap_steps(first: str, second: str) -> Any:
 STRUCTURAL_MUTATIONS = {
     # Order within a step (passes a per-step set check, fails the sequence).
     "break-before-health-check": _edit_lines(
-        VERIFY, lambda lines: lines.insert(lines.index(HEALTH_LINE), lines.pop(8))
+        VERIFY,
+        lambda lines: lines.insert(lines.index(HEALTH_LINE), lines.pop(lines.index(BREAK_LINE))),
     ),
-    "test-before-promote": _edit_lines(PROMOTE_STEP, lambda lines: lines.append(lines.pop(0))),
+    "test-before-promote": _edit_lines(
+        PROMOTE_STEP, lambda lines: lines.insert(0, lines.pop(lines.index(DIGEST_TEST_LINE)))
+    ),
     "duplicate-pull": _edit_lines(VERIFY, lambda lines: lines.insert(0, lines[0])),
-    "duplicate-promote": _edit_lines(PROMOTE_STEP, lambda lines: lines.insert(0, lines[0])),
-    "missing-digest-test": _edit_lines(PROMOTE_STEP, lambda lines: lines.pop()),
-    "missing-exit-in-refuse": _edit_lines(REFUSE, lambda lines: lines.remove("exit 1")),
-    "missing-health-check": _edit_lines(VERIFY, lambda lines: lines.remove(HEALTH_LINE)),
+    "duplicate-promote": _edit_lines(
+        PROMOTE_STEP, lambda lines: lines.__setitem__(slice(0, 0), PROMOTE_COMMAND)
+    ),
+    "missing-digest-test": _edit_lines(PROMOTE_STEP, lambda lines: lines.remove(DIGEST_TEST_LINE)),
+    "missing-exit-in-refuse": _edit_lines(REFUSE, lambda lines: lines.remove("  exit 1")),
+    "missing-health-check": _edit_lines(
+        VERIFY, lambda lines: [lines.remove(line) for line in HEALTH_COMMAND]
+    ),
     "emptied-script": _edit_lines(REMOVE, lambda lines: lines.clear()),
+    "missing-final-newline": _edit_lines(PROMOTE_STEP, lambda lines: lines.pop()),
     # Promote injected into another step (cross-step).
-    "promote-in-verify": _edit_lines(VERIFY, lambda lines: lines.insert(3, PROMOTE_LINE)),
-    "promote-in-reread": _edit_lines(REREAD, lambda lines: lines.append(PROMOTE_LINE)),
+    "promote-in-verify": _edit_lines(
+        VERIFY, lambda lines: lines.__setitem__(slice(6, 6), PROMOTE_COMMAND)
+    ),
+    "promote-in-reread": _edit_lines(
+        REREAD, lambda lines: lines.__setitem__(slice(-1, -1), PROMOTE_COMMAND)
+    ),
     # Steps added, removed, renamed, duplicated, reordered.
     "new-bash-step": lambda workflow: _steps(workflow).insert(
         3, {"name": "Debug", "shell": "bash", "run": "docker logs ghidra-mcp-ci\n"}
@@ -1465,7 +1513,7 @@ def test_publish_allowlist_sequence_check_catches_what_a_set_check_misses() -> N
     workflow = copy.deepcopy(_workflow())
     STRUCTURAL_MUTATIONS["break-before-health-check"](workflow)
     run = _publish_step(workflow, VERIFY)["run"]
-    assert set(_logical_lines(run)) == set(PUBLISH_RUN_LINES[VERIFY])
+    assert set(_physical_lines(run)) == set(PUBLISH_RUN_LINES[VERIFY])
     assert _line_problems(run) == []
     assert _publish_problems(workflow) == [
         f"{VERIFY}: lines differ from the frozen sequence (order, duplicate or missing)"
@@ -1518,15 +1566,138 @@ def test_publish_allowlist_reports_a_line_moved_to_another_step() -> None:
     # both as a line foreign to that step and as a broken sequence.
     workflow = copy.deepcopy(_workflow())
     STRUCTURAL_MUTATIONS["promote-in-verify"](workflow)
+    # The last physical line of the promote command (the candidate image) is also a
+    # line of Verify, so only the sequence check reports it.
     assert _publish_problems(workflow) == [
-        f"{VERIFY}: line 3 is not allowlisted for this step: {PROMOTE_LINE}",
+        f"{VERIFY}: line 6 is not allowlisted for this step: {PROMOTE_COMMAND[0]}",
+        f"{VERIFY}: line 7 is not allowlisted for this step: {PROMOTE_COMMAND[1]}",
+        f"{VERIFY}: line 8 is not allowlisted for this step: {PROMOTE_COMMAND[2]}",
         f"{VERIFY}: lines differ from the frozen sequence (order, duplicate or missing)",
     ]
 
 
-def test_publish_line_allowlist_joins_only_blank_backslash_continuations() -> None:
-    assert _line_problems("docker rm -f \\\n    ghidra-mcp-ci 2>/dev/null || true\n\n") == []
+def test_publish_line_allowlist_never_joins_continuations() -> None:
+    # Both were accepted by the SAF-50 normalisation (the first one was the only
+    # accepted shape); with physical lines neither is a frozen line.
+    assert _line_problems("docker rm -f \\\n    ghidra-mcp-ci 2>/dev/null || true")
     assert _line_problems("docker rm -f\\\n    ghidra-mcp-ci 2>/dev/null || true")
+    # The joined form of a frozen multi-line command is not a frozen line either.
+    joined = " ".join(line.strip().removesuffix(" \\") for line in PROMOTE_COMMAND)
+    assert _line_problems(joined) == [f"not allowlisted: {joined}"]
+
+
+# --- R1: continuations and whitespace inside quotes and `${{ }}` (PR #19 review). ---
+
+
+def _with_step_run(name: str, run: str) -> dict[str, Any]:
+    workflow = copy.deepcopy(_workflow())
+    _publish_step(workflow, name)["run"] = run
+    return workflow
+
+
+def _split_at(name: str, line: str, fragment: str) -> str:
+    """The step's script with ` \\<newline>` plus the line's indentation inserted after
+    `fragment` (which must end right before a blank) in `line`."""
+    frozen = PUBLISH_RUN_LINES[name]
+    assert frozen.count(line) == 1, line
+    head, blank, tail = line.partition(fragment + " ")
+    assert blank, (fragment, line)
+    indent = line[: len(line) - len(line.lstrip(" "))]
+    index = frozen.index(line)
+    split = (head + fragment + " \\", indent + "  " + tail)
+    return "\n".join((*frozen[:index], *split, *frozen[index + 1 :]))
+
+
+R1_LINE_IN_REREAD = PUBLISH_RUN_LINES[REREAD][3]
+R1_LINE_IN_REFUSE = PUBLISH_RUN_LINES[REFUSE][5]
+R1_SPLITS = {
+    # Each split was mapped back onto the frozen logical line by the SAF-50 join.
+    "unquoted": (VERIFY, PUBLISH_RUN_LINES[VERIFY][0], "docker pull"),
+    "inside-command-substitution": (VERIFY, PUBLISH_RUN_LINES[VERIFY][1], 'TOKEN="$(openssl rand'),
+    "double-quoted": (REREAD, R1_LINE_IN_REREAD, '  echo "VERSION $VERSION does not'),
+    "single-quoted-grep-pattern": (REFUSE, R1_LINE_IN_REFUSE, "if ! grep -Eqi 'manifest"),
+    "single-quoted-python": (VERIFY, HEALTH_LINE, "    python3 -c 'import json,sys;"),
+    "single-quoted-go-template": (
+        PROMOTE_STEP,
+        PUBLISH_RUN_LINES[PROMOTE_STEP][6],
+        "  --format '{{json",
+    ),
+    # The `${{ }}` category the SAF-50 residual analysis missed: Actions, not bash,
+    # reads this text, and a backslash inside an expression is a lexing error there.
+    "inside-expression-after-open": (
+        VERIFY,
+        PUBLISH_RUN_LINES[VERIFY][0],
+        'docker pull "${IMAGE_NAME}@${{',
+    ),
+    "inside-expression-before-close": (
+        PROMOTE_STEP,
+        DIGEST_TEST_LINE,
+        'test "$VERSION_DIGEST" = "${{ steps.image.outputs.digest',
+    ),
+    "inside-expression-in-health-arguments": (
+        VERIFY,
+        PUBLISH_RUN_LINES[VERIFY][11],
+        '      "${{ steps.version.outputs.value }}" "${{ github.sha',
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "line", "fragment"),
+    [pytest.param(*case, id=case_id) for case_id, case in R1_SPLITS.items()],
+)
+def test_publish_allowlist_rejects_a_continuation_inside_a_frozen_line(
+    name: str, line: str, fragment: str
+) -> None:
+    problems = _publish_problems(_with_step_run(name, _split_at(name, line, fragment)))
+    assert any("is not allowlisted for this step" in problem for problem in problems), problems
+
+
+def test_publish_allowlist_rejects_a_continuation_at_every_blank() -> None:
+    # Exhaustive form of R1: every blank of every frozen line (unquoted, quoted,
+    # inside `$( )` or `${{ }}`) replaced by ` \\<newline>  `.
+    cases = 0
+    for name, frozen in PUBLISH_RUN_LINES.items():
+        for index, line in enumerate(frozen):
+            for column, character in enumerate(line):
+                if character != " " or not line[:column].strip():
+                    continue
+                split = (line[:column] + " \\", "  " + line[column + 1 :])
+                run = "\n".join((*frozen[:index], *split, *frozen[index + 1 :]))
+                assert _publish_problems(_with_step_run(name, run)), (name, line, column)
+                cases += 1
+    assert cases >= 185
+
+
+R1_WHITESPACE = {
+    # A blank after the backslash turns `\<newline>` into an escaped blank followed
+    # by the end of the command; stripping lines hid it.
+    "blank-after-continuation": (VERIFY, 2, lambda line: line + " "),
+    "indentation-changed": (VERIFY, 3, lambda line: "    " + line),
+    "indentation-removed": (REREAD, 3, str.lstrip),
+    "trailing-blank": (REMOVE, 0, lambda line: line + " "),
+    "blank-line-added": (PROMOTE_STEP, 4, lambda line: "\n" + line),
+}
+
+
+def test_publish_allowlist_names_a_forbidden_character_in_a_step() -> None:
+    # Any forbidden character already makes the line differ from every frozen line;
+    # the dedicated check only gives the clearer reason, and reports it alone.
+    lines = list(PUBLISH_RUN_LINES[REMOVE])
+    lines[0] = lines[0].replace(" ", "\t", 1)
+    assert _publish_problems(_with_step_run(REMOVE, "\n".join(lines))) == [
+        f"{REMOVE}: forbidden character(s) '\\t'"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "index", "edit"),
+    [pytest.param(*case, id=case_id) for case_id, case in R1_WHITESPACE.items()],
+)
+def test_publish_allowlist_compares_whitespace_exactly(name: str, index: int, edit: Any) -> None:
+    lines = list(PUBLISH_RUN_LINES[name])
+    lines[index] = edit(lines[index])
+    assert _publish_problems(_with_step_run(name, "\n".join(lines)))
 
 
 # --- Duplicate mapping keys (PR #19 review, A21/A22). ---

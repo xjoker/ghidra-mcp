@@ -47,6 +47,12 @@ class _InterruptibleStdin(io.RawIOBase):
     block interpreter exit. Where ``select.poll`` exists it waits for input in short polls
     before each read, so after ``release()`` it stops reading fd 0 instead of taking the
     next chunk meant for whoever reads stdin after ``MCPService.run`` returns.
+
+    That is best effort: the copying thread checks for ``stop()``/``release()`` after its
+    poll and then reads without holding a lock, so input that is already waiting in fd 0
+    when either is called can still be read once more (one chunk of up to 64 KiB, which
+    may include bytes that arrive just after the call) and is then dropped. Input that
+    arrives while the thread is still in its last poll stays in fd 0.
     """
 
     _CHUNK_SIZE = 64 * 1024
@@ -199,7 +205,7 @@ class MCPService:
         if self._stdin is None and threading.current_thread() is not threading.main_thread():
             # A JVM signal thread, and nothing this thread can stop: stdio whose sys.stdin
             # has no file descriptor (embedded use), or a forwarded SIGTERM outside uvicorn's
-            # serve window. Only the main thread can unwind the event loop, and
+            # serve window. This thread cannot end the transport, and
             # _thread.interrupt_main() does not wake a loop idle in select(), so recording
             # the request here would swallow the signal. The JVM's handler takes it instead:
             # Java shutdown hooks run and the process exits 143, without drain or close_all.
@@ -215,8 +221,12 @@ class MCPService:
             return None
         # Main thread. streamable-http: uvicorn handles SIGTERM itself while serving and
         # re-raises it afterwards; this handler sees it then, or before uvicorn has started
-        # serving. Also stdio when stdin has no file descriptor to wrap. SystemExit unwinds
-        # the event loop; the finally block in run() still drains and runs close_all.
+        # serving. Also stdio when stdin has no file descriptor to wrap, before the JVM has
+        # started (afterwards SIGTERM arrives on a JVM thread, above). SystemExit ends the
+        # event loop and the finally block in run() still drains and runs close_all. For
+        # stdio without a file descriptor that is not immediate: the transport's stdin read
+        # cannot be cancelled, so the process exits (143) only at the next stdin message,
+        # which gets no reply, or at stdin EOF.
         raise SystemExit(_SIGTERM_EXIT_STATUS)
 
     @contextmanager

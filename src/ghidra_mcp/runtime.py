@@ -371,10 +371,15 @@ class ProgramWorkspace:
                 raise WorkspaceError(f"程序会话不存在：{program_id}") from error
 
     def resource_key(self, program_id: str) -> str:
-        """返回会话底层程序的稳定资源键，使同一程序的不同会话写入互斥。
+        """Return a stable resource key for the session's program so that writes from
+        different sessions of the same program are mutually exclusive.
 
-        在事件循环线程上调用，因此不取 self._lock：close() 持锁期间会存盘，
-        取锁会让传输层卡住。单次 dict 读取在 GIL 下是原子的。
+        This may be called from the event loop thread or from a pool thread (the server
+        resolves resource keys through ``asyncio.to_thread``). It still does not take
+        ``self._lock``: ``close()`` saves while holding that lock, so waiting on it here
+        would stall the caller. Lock-free reading is safe because a single ``dict.get`` is
+        atomic under the CPython GIL, and ``record.path`` never changes while the record
+        is alive.
         """
 
         record = self._programs.get(program_id)

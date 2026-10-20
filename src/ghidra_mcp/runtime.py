@@ -8,7 +8,9 @@ from hashlib import sha256
 import logging
 from pathlib import Path
 import re
+import signal
 import sys
+import threading
 from threading import RLock
 from time import monotonic
 from types import ModuleType
@@ -52,6 +54,67 @@ def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
                 return int(major), int(minor), int(patch or 0)
             break
     raise WorkspaceError(f"无法确认 Ghidra 版本：{properties} 缺少有效的 application.version")
+
+
+def _detach_current_thread_from_jvm() -> None:
+    """Detach the calling thread from the JVM; a no-op when no real JVM is running."""
+
+    import jpype
+
+    if jpype.isJVMStarted():
+        jpype.JClass("java.lang.Thread").detach()
+
+
+# Keeps the Java-side SIGTERM handler proxy (and the handler it replaced) alive.
+_JVM_SIGTERM_FORWARDER: list[Any] = []
+
+
+def _forward_jvm_sigterm_to_python() -> None:
+    """Hand SIGTERM back to Python once the JVM has started.
+
+    On start-up the JVM installs its own SIGTERM handler, which runs Java shutdown hooks
+    and exits with status 143 without returning to Python, so the drain and ``close_all``
+    in ``MCPService.run`` never ran. This replaces the Java handler with one that calls the
+    Python-level SIGTERM handler that is current at signal time (ghidra-mcp's own handler,
+    or uvicorn's while it serves HTTP). Python's SIG_IGN is honoured. When Python has the
+    default disposition, or the Python handler fails, it falls back to the JVM's previous
+    handler, so library users that never install a handler keep the old behaviour. The
+    handler runs on a JVM signal thread, so Python handlers reached this way must be
+    thread-safe; ghidra-mcp's handler and uvicorn's only set flags. A no-op without a
+    real JVM.
+    """
+
+    import jpype
+
+    if not jpype.isJVMStarted() or _JVM_SIGTERM_FORWARDER:
+        return
+    previous: list[Any] = []
+
+    @jpype.JImplements("sun.misc.SignalHandler")
+    class _SigtermForwarder:
+        @jpype.JOverride
+        def handle(self, sig: Any) -> None:
+            handler = signal.getsignal(signal.SIGTERM)
+            if handler == signal.SIG_IGN:
+                return
+            if callable(handler):
+                try:
+                    handler(signal.SIGTERM, None)
+                    return
+                except BaseException:
+                    _LOGGER.exception("Python SIGTERM handler failed; using the JVM default")
+            previous[0].handle(sig)
+
+    signal_class = jpype.JClass("sun.misc.Signal")
+    forwarder = _SigtermForwarder()
+    try:
+        previous.append(signal_class.handle(signal_class("TERM"), forwarder))
+    except Exception:
+        # For example -Xrs, or SIGTERM ignored when the JVM started: the JVM then does not
+        # own SIGTERM and Python's handler already receives it directly.
+        _LOGGER.info("JVM does not own SIGTERM; leaving it to Python", exc_info=True)
+        return
+    _JVM_SIGTERM_FORWARDER.extend((forwarder, previous))
 
 
 @dataclass(slots=True)
@@ -102,8 +165,44 @@ class GhidraRuntime:
                         f"请安装 Ghidra {minimum} 或更高版本，"
                         "并将 GHIDRA_INSTALL_DIR 指向新的安装目录"
                     )
-                self._launcher = self.pyghidra.start(install_dir=self.install_dir)
+                self._launcher = self._start_jvm()
             return self._launcher
+
+    def _start_jvm(self) -> object:
+        """Start PyGhidra on a short-lived helper thread that detaches from the JVM before it ends.
+
+        JNI turns the thread that creates the JVM into the non-daemon Java thread "main".
+        If that thread ends without detaching (it used to be a tool worker thread), the JVM
+        keeps counting it as alive, and the DestroyJavaVM call that JPype makes at
+        interpreter exit waits for it forever: the process never exits after stdin EOF.
+        The helper detaches right after start-up, so later Java calls from worker threads
+        are attached by JPype as daemon threads and nothing blocks JVM shutdown.
+        """
+
+        outcome: dict[str, Any] = {}
+
+        def start() -> None:
+            try:
+                outcome["launcher"] = self.pyghidra.start(install_dir=self.install_dir)
+            except BaseException as error:
+                outcome["error"] = error
+            else:
+                try:
+                    _forward_jvm_sigterm_to_python()
+                except Exception:
+                    _LOGGER.warning("Could not route JVM SIGTERM to Python", exc_info=True)
+            finally:
+                try:
+                    _detach_current_thread_from_jvm()
+                except Exception:
+                    _LOGGER.warning("Could not detach the JVM start-up thread", exc_info=True)
+
+        helper = threading.Thread(target=start, name="ghidra-mcp-jvm-start", daemon=True)
+        helper.start()
+        helper.join()
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["launcher"]
 
     def analyze(self, program: Any) -> None:
         self.ensure_started()
@@ -320,12 +419,18 @@ class ProgramWorkspace:
     def close_all(self) -> None:
         with self._lock:
             program_ids = tuple(self._programs)
+        _LOGGER.info("close_all: closing %d open program(s)", len(program_ids))
         failures: list[BaseException] = []
         for program_id in program_ids:
             try:
                 self.close(program_id)
             except BaseException as error:
                 failures.append(error)
+        _LOGGER.info(
+            "close_all: finished, %d closed, %d failed",
+            len(program_ids) - len(failures),
+            len(failures),
+        )
         if len(failures) == 1:
             raise failures[0]
         if failures:

@@ -8,6 +8,7 @@ mocked. tests/integration/test_real_ghidra_shutdown.py repeats the key cases wit
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 import signal
@@ -346,6 +347,42 @@ def test_interruptible_stdin_leaves_input_that_arrives_during_the_last_poll_in_f
         os.close(read_fd)
 
 
+@pytest.mark.parametrize("ending", ["stop", "release"])
+def test_interruptible_stdin_copying_thread_ends_within_a_poll_interval(ending: str) -> None:
+    """The copying thread idles in short polls, so it ends soon after stop() or release().
+
+    A SIGTERM shutdown waits at most one poll for the thread, and release() (called from
+    run()'s finally block) blocks at most that long. The bound is far above the 0.25 s poll
+    but well below a poll of several seconds.
+    """
+
+    import select
+
+    from ghidra_mcp.service import _InterruptibleStdin
+
+    if not hasattr(select, "poll"):
+        pytest.skip("needs select.poll")
+    read_fd, write_fd = os.pipe()
+    try:
+        raw = _InterruptibleStdin(read_fd)
+        # No input: the copying thread is idle inside a poll when it is told to end.
+        time.sleep(0.1)
+        assert raw._pump.is_alive()
+        started = time.monotonic()
+        if ending == "stop":
+            raw.stop()
+            raw._pump.join(DEADLINE)
+        else:
+            raw.release()
+            assert not raw._pump.is_alive()
+        elapsed = time.monotonic() - started
+        assert not raw._pump.is_alive()
+        assert elapsed < 1.5, f"copying thread took {elapsed:.2f} s to end after {ending}()"
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
 # ------------------------------------------------------------- handler semantics
 
 
@@ -410,6 +447,34 @@ def test_sigterm_off_the_main_thread_with_nothing_to_stop_is_left_to_the_jvm(
     result = _call_on_another_thread(service._on_sigterm, signal.SIGTERM, None)
     assert result is SIGTERM_NOT_HANDLED
     assert not service._terminate_requested.is_set()
+    service.tool_executor.close()
+
+
+@pytest.mark.parametrize("transport", ["stdio", "streamable-http"])
+@pytest.mark.parametrize("state", ["draining", "terminate_requested"])
+def test_sigterm_off_the_main_thread_during_shutdown_is_ignored_not_left_to_the_jvm(
+    transport: str, state: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A SIGTERM on a JVM thread while shutdown is under way is ignored, even with no wrapper.
+
+    Handing it to the JVM (as when there is nothing to stop) would exit 143 at once and cut
+    off the drain and close_all that are already running, for example after stdin EOF in
+    embedded stdio, where sys.stdin has no file descriptor.
+    """
+
+    from ghidra_mcp.runtime import SIGTERM_NOT_HANDLED
+
+    service = _service(transport)
+    assert service._stdin is None
+    getattr(service, f"_{state}").set()
+    with caplog.at_level(logging.WARNING, logger="ghidra_mcp.service"):
+        result = _call_on_another_thread(service._on_sigterm, signal.SIGTERM, None)
+    assert result is not SIGTERM_NOT_HANDLED
+    assert result is None
+    assert "SIGTERM received again; shutdown is already in progress" in caplog.text
+    assert "leaving it to the JVM" not in caplog.text
+    if state == "draining":
+        assert not service._terminate_requested.is_set()
     service.tool_executor.close()
 
 

@@ -92,15 +92,45 @@ _UniqueKeySafeLoader.add_constructor(
 )
 
 
-def _load_workflow(text: str) -> dict[str, Any]:
+class WorkflowBytesError(ValueError):
+    """The raw workflow file contains bytes the YAML loader would silently normalise."""
+
+
+def _raw_workflow_problems(raw: bytes) -> list[str]:
+    """Checks on the file bytes, before any decoding or YAML parsing.
+
+    A YAML loader turns CR, CRLF and NEL (U+0085) into line feeds, so neither the
+    allowlist nor FORBIDDEN_CHARACTER can see them in the loaded strings. GitHub's
+    parser should normalise the same way, but the comparison must not depend on two
+    parsers agreeing: the file has to be plain ASCII with LF line endings.
+    """
+    problems = []
+    if b"\r" in raw:
+        problems.append("raw workflow contains CR (\\r)")
+    if b"\x85" in raw:
+        problems.append("raw workflow contains a NEL byte (\\x85)")
+    non_ascii = sorted({f"0x{byte:02x}" for byte in raw if byte > 0x7F})
+    if non_ascii:
+        problems.append(f"raw workflow contains non-ASCII bytes {', '.join(non_ascii)}")
+    return problems
+
+
+def _load_workflow(raw: bytes) -> dict[str, Any]:
+    problems = _raw_workflow_problems(raw)
+    if problems:
+        raise WorkflowBytesError("; ".join(problems))
     # _UniqueKeySafeLoader is a SafeLoader subclass: only standard YAML tags are built.
-    data = yaml.load(text, Loader=_UniqueKeySafeLoader)
+    data = yaml.load(raw.decode("ascii"), Loader=_UniqueKeySafeLoader)
     assert isinstance(data, dict)
     return data
 
 
 def _workflow() -> dict[str, Any]:
-    return _load_workflow(WORKFLOW.read_text(encoding="utf-8"))
+    return _load_workflow(WORKFLOW.read_bytes())
+
+
+def _workflow_text() -> str:
+    return WORKFLOW.read_bytes().decode("utf-8")
 
 
 def _jobs() -> dict[str, list[Step]]:
@@ -828,6 +858,7 @@ def _publish_problems(workflow: dict[str, Any]) -> list[str]:
 
 
 def test_publish_job_matches_the_frozen_allowlist() -> None:
+    assert _raw_workflow_problems(WORKFLOW.read_bytes()) == []
     assert _publish_problems(_workflow()) == []
 
 
@@ -1261,12 +1292,18 @@ PULL_ANCHOR = '          docker pull "${IMAGE_NAME}@'
 OUTPUT_ANCHOR = 'echo "value=$VERSION" >> "$GITHUB_OUTPUT"\n'
 
 
-def _text_mutation(old: str, new: str) -> dict[str, Any]:
-    """The workflow with the last occurrence of `old` (inside the publish job) replaced."""
-    text = WORKFLOW.read_text(encoding="utf-8")
+def _text_mutation_problems(old: str, new: str) -> list[str]:
+    """Why the workflow with the last occurrence of `old` (inside the publish job)
+    replaced by `new` is rejected: raw bytes, YAML keys, then the frozen tables."""
+    text = _workflow_text()
     index = text.rindex(old)
     assert text.index("\n  publish:") < index, old
-    return _load_workflow(text[:index] + new + text[index + len(old) :])
+    raw = (text[:index] + new + text[index + len(old) :]).encode("utf-8")
+    try:
+        workflow = _load_workflow(raw)
+    except (WorkflowBytesError, yaml.YAMLError) as error:
+        return [str(error)]
+    return _publish_problems(workflow)
 
 
 def _before_pull(line: str) -> tuple[str, str]:
@@ -1338,7 +1375,7 @@ TEXT_MUTATIONS = {
     ("old", "new"), [pytest.param(*pair, id=name) for name, pair in TEXT_MUTATIONS.items()]
 )
 def test_publish_allowlist_rejects_workflow_text_mutations(old: str, new: str) -> None:
-    assert _publish_problems(_text_mutation(old, new))
+    assert _text_mutation_problems(old, new)
 
 
 def _publish_step(workflow: dict[str, Any], name: str) -> dict[str, Any]:
@@ -1729,7 +1766,7 @@ DUPLICATE_KEY_MUTATIONS = {
 
 
 def _replace_in_publish(old: str, new: str) -> str:
-    text = WORKFLOW.read_text(encoding="utf-8")
+    text = _workflow_text()
     index = text.index(old, text.index("\n  publish:"))
     return text[:index] + new + text[index + len(old) :]
 
@@ -1743,9 +1780,78 @@ def test_workflow_loader_rejects_duplicate_keys(old: str, new: str) -> None:
     # Plain safe_load keeps the last key, so the frozen tables alone would pass it.
     assert _publish_problems(yaml.safe_load(text)) == []
     with pytest.raises(yaml.constructor.ConstructorError, match="found duplicate key"):
-        _load_workflow(text)
+        _load_workflow(text.encode("utf-8"))
 
 
 def test_workflow_loader_matches_safe_load_on_the_production_workflow() -> None:
-    text = WORKFLOW.read_text(encoding="utf-8")
-    assert _load_workflow(text) == yaml.safe_load(text)
+    text = _workflow_text()
+    assert _load_workflow(text.encode("utf-8")) == yaml.safe_load(text)
+
+
+# --- Raw bytes: CR, NEL and non-ASCII before YAML parsing (PR #19 review). ---
+
+REFUSE_BREAK = "            exit 1\n          fi\n          if ! grep"
+RAW_MUTATIONS = {
+    # case: (old, new, invisible once a YAML loader has normalised line breaks)
+    "C01-nel-between-lines": (
+        REFUSE_BREAK,
+        REFUSE_BREAK.replace("exit 1\n", "exit 1\x85", 1),
+        True,
+    ),
+    "C03-cr-only-line-break": (
+        REFUSE_BREAK,
+        REFUSE_BREAK.replace("exit 1\n", "exit 1\r", 1),
+        True,
+    ),
+    "crlf-line-break-in-run": (
+        "docker logs ghidra-mcp-ci\n",
+        "docker logs ghidra-mcp-ci\r\n",
+        True,
+    ),
+    "C02-line-separator": (
+        REFUSE_BREAK,
+        REFUSE_BREAK.replace("exit 1\n", "exit 1\u2028", 1),
+        False,
+    ),
+    "non-ascii-in-a-comment": (
+        "  # Only this job can write packages.",
+        "  # Only this job can write packages.\u00a0",
+        True,
+    ),
+}
+
+
+def _raw_mutation(old: str, new: str) -> bytes:
+    text = _workflow_text()
+    assert text.count(old) >= 1, old
+    return text.replace(old, new, 1).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "invisible"),
+    [pytest.param(*case, id=case_id) for case_id, case in RAW_MUTATIONS.items()],
+)
+def test_raw_workflow_bytes_are_checked_before_yaml_parsing(
+    old: str, new: str, invisible: bool
+) -> None:
+    raw = _raw_mutation(old, new)
+    assert _raw_workflow_problems(raw)
+    with pytest.raises(WorkflowBytesError):
+        _load_workflow(raw)
+    if invisible:
+        # What the allowlist alone sees after safe_load: nothing to reject.
+        assert _publish_problems(yaml.safe_load(raw.decode("utf-8"))) == []
+
+
+def test_raw_workflow_check_names_each_problem() -> None:
+    assert _raw_workflow_problems(b"a: 1\r\n") == ["raw workflow contains CR (\\r)"]
+    assert _raw_workflow_problems("a: 1\x85".encode("latin-1")) == [
+        "raw workflow contains a NEL byte (\\x85)",
+        "raw workflow contains non-ASCII bytes 0x85",
+    ]
+    assert _raw_workflow_problems("a: \u00e9\n".encode("utf-8")) == [
+        "raw workflow contains non-ASCII bytes 0xa9, 0xc3"
+    ]
+    whole_file_crlf = _workflow_text().replace("\n", "\r\n").encode("ascii")
+    assert _raw_workflow_problems(whole_file_crlf) == ["raw workflow contains CR (\\r)"]
+    assert _raw_workflow_problems(WORKFLOW.read_bytes()) == []

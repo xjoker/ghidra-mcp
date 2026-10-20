@@ -41,22 +41,31 @@ _CLIENT_SAFE_ERRORS = (WorkspaceError, ToolInputError)
 # Something that looks like an absolute host path:
 # - a POSIX "/x" that does not continue an ASCII word or a relative "./" / "../" segment
 #   (this also covers "file:///x" URLs);
-# - a well-known root directory ("/home/", "/srv", "\Users\", ...) wherever it appears,
-#   including right after an ASCII letter, digit, "_" or "." ("projectdir/srv/x");
+# - a well-known root directory followed by a separator ("/home/", "/srv/", "\Users\", ...)
+#   wherever it appears, including right after an ASCII letter, digit, "_" or "."
+#   ("projectdir/srv/x"); a root name that only ends a word ("x86/data") is not a path;
 # - a Windows drive "C:\" or "C:/", a UNC "\\server" prefix, or a root-relative
-#   "\Users\x" with no drive letter;
+#   "\Users\x" with no drive letter, but not a lone escape sequence such as "\n", "\d",
+#   "\x41" or "\u00e9" (one that is followed by a further path character still matches);
 # - a home directory "~/x" or "~user/x".
 # It is deliberately conservative: http(s) URLs and Ghidra category paths such as
 # "/Demangler/foo" match too, so foreign errors that contain them are hidden as well.
 _WELL_KNOWN_ROOTS = (
     "home|Users|tmp|var|opt|srv|data|workspace|root|mnt|private|etc|usr|Volumes|media"
 )
+# A backslash escape (a letter, up to three octal digits, \xHH, \uHHHH, \UHHHHHHHH or one
+# ASCII punctuation character) that no further path character follows. Non-ASCII characters
+# count as path characters, so "\数据\项目" or "\Документы" is still a path.
+_LONE_ESCAPE = (
+    r"(?:[A-Za-z]|[0-7]{1,3}|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}"
+    r"|(?=[!-~])[^A-Za-z0-9_.~$\\/-])(?![A-Za-z0-9_.~$\\/-]|[^\x00-\x7f])"
+)
 _ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_.])/(?=[^\s/])"
-    rf"|[/\\](?:{_WELL_KNOWN_ROOTS})(?![A-Za-z0-9_.-])"
+    rf"|[/\\](?:{_WELL_KNOWN_ROOTS})(?=[/\\])"
     r"|(?<![A-Za-z0-9])[A-Za-z]:[\\/]"
     r"|\\\\"
-    r"|(?<![A-Za-z0-9_\\])\\(?=[^\s\\])"
+    rf"|(?<![A-Za-z0-9_\\])\\(?=[^\s\\])(?!{_LONE_ESCAPE})"
     r"|(?<![A-Za-z0-9_.])~[A-Za-z0-9_.-]*[/\\]"
 )
 

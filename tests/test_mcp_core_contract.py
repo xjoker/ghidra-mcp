@@ -778,8 +778,15 @@ def test_existing_program_file_error_after_enter_never_falls_back_to_import(
 ) -> None:
     from ghidra_mcp.runtime import GhidraRuntime
 
+    class ProjectData:
+        def getFile(self, _path):
+            return object()
+
     class Project:
         closed = False
+
+        def getProjectData(self):
+            return ProjectData()
 
         def close(self):
             self.closed = True

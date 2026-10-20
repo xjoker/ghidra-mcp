@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import md5, sha256
 import logging
 from pathlib import Path
 import re
@@ -292,8 +292,8 @@ class GhidraRuntime:
         location = project_location or binary.parent
         name = project_name or f"{binary.name}_ghidra"
         project = self.pyghidra.open_project(location, name, create=True)
-        project_path = f"/{binary.name}"
         try:
+            project_path = self._stored_program_path(project, binary)
             existing_context = self.pyghidra.program_context(project, project_path)
             try:
                 program = existing_context.__enter__()
@@ -331,6 +331,83 @@ class GhidraRuntime:
         finally:
             project.close()
 
+    def _stored_program_path(self, project: Any, binary: Path) -> str:
+        """Return the project path of the program that an earlier import of ``binary`` stored.
+
+        Most loaders store the program under the import name, ``/{binary.name}``. Ghidra's
+        ``ApkLoader`` ignores that name and stores one program per DEX file, named after the
+        file inside the APK (``/classes.dex``, ``/classes2.dex``, ...); ``Loaded.save`` adds
+        ``.0``, ``.1``, ... when the name is taken. When ``/{binary.name}`` is absent, this
+        looks for the programs whose ``FSRL`` (which Ghidra records in Program Information at
+        import time) has ``binary`` as its outermost file, matched by MD5. Of those it picks
+        the primary program: the shortest inner path first (``classes.dex`` before
+        ``classes2.dex`` and ``classes10.dex``, the order ``ApkLoader`` loads them in), then a
+        program that has been analysed, then Ghidra's import order (no suffix, ``.0``,
+        ``.1``, ...). So a project that older versions filled with unanalysed copies reopens
+        the analysed original. Without a match it returns ``/{binary.name}`` and the caller
+        imports as before.
+        """
+
+        expected = f"/{binary.name}"
+        project_data = project.getProjectData()
+        if project_data.getFile(expected) is not None:
+            return expected
+        binary_md5: str | None = None
+        candidates: list[tuple[int, str, bool, int, str]] = []
+        for domain_file in project_data:
+            if str(domain_file.getContentType()) != "Program":
+                continue
+            metadata = domain_file.getMetadata()
+            source = self._source_fsrl(metadata.get("FSRL"))
+            if source is None:
+                continue
+            outer_md5, inner_path = source
+            if binary_md5 is None:
+                binary_md5 = _file_md5(binary)
+            if outer_md5 is None or outer_md5.lower() != binary_md5:
+                continue
+            name = str(domain_file.getName())
+            inner_name = inner_path.rsplit("/", 1)[-1]
+            suffix = name.removeprefix(f"{inner_name}.")
+            if name == inner_name:
+                import_order = -1
+            elif suffix != name and suffix.isdigit():
+                import_order = int(suffix)
+            else:
+                import_order = sys.maxsize
+            functions = str(metadata.get("# of Functions") or "0")
+            analysed = str(metadata.get("Analyzed")).lower() == "true" or functions != "0"
+            pathname = str(domain_file.getPathname())
+            candidates.append((len(inner_path), inner_path, not analysed, import_order, pathname))
+        if not candidates:
+            return expected
+        candidates.sort()
+        chosen = candidates[0]
+        duplicates = [item[4] for item in candidates[1:] if item[1] == chosen[1]]
+        _LOGGER.info("Reopening %s from project file %s", binary.name, chosen[4])
+        if duplicates:
+            _LOGGER.warning(
+                "Project for %s also holds other imports of the same program: %s",
+                binary.name,
+                ", ".join(duplicates),
+            )
+        return chosen[4]
+
+    def _source_fsrl(self, value: Any) -> tuple[str | None, str] | None:
+        """Split a Program Information ``FSRL`` value into (outermost file MD5, inner path)."""
+
+        if value is None:
+            return None
+        from ghidra.formats.gfilesystem import FSRL
+
+        try:
+            levels = FSRL.fromString(str(value)).split()
+        except Exception:
+            _LOGGER.debug("Ignoring unparsable FSRL %r", value, exc_info=True)
+            return None
+        outer_md5 = levels[0].getMD5()
+        return (None if outer_md5 is None else str(outer_md5)), str(levels[-1].getPath())
+
     def _flat_api(self, program: Any) -> Any:
         from ghidra.program.flatapi import FlatProgramAPI
 
@@ -345,6 +422,14 @@ class GhidraRuntime:
         """在工具返回成功前持久化当前程序数据库。"""
 
         api.getCurrentProgram().save("ghidra-mcp", self.pyghidra.task_monitor())
+
+
+def _file_md5(binary: Path) -> str:
+    digest = md5(usedforsecurity=False)
+    with binary.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _persistent_project_name(binary: Path) -> str:

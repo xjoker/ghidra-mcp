@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from shutdown_harness import (
+    AFTER_RUN_SCRIPT,
     FAKE_SERVICE_SCRIPT,
     TEST_TOKEN,
     ServerProcess,
@@ -61,23 +62,36 @@ def _environment(
     }
 
 
-def _start_stdio(tmp_path: Path, *, workers: int = 1, slow_seconds: float = 0.0) -> ServerProcess:
+def _start_stdio(
+    tmp_path: Path,
+    *,
+    workers: int = 1,
+    slow_seconds: float = 0.0,
+    script: str = FAKE_SERVICE_SCRIPT,
+    extra_env: dict[str, str] | None = None,
+) -> ServerProcess:
     env = _environment(tmp_path, transport="stdio", workers=workers, slow_seconds=slow_seconds)
-    server = start_server(FAKE_SERVICE_SCRIPT, env=env, cwd=tmp_path, stdio=True)
-    server.stdio_initialize(DEADLINE)
-    server.stdio_call(
-        2, "program_open", {"binary_path": str(tmp_path / "inputs" / "fast.bin"), "analyze": False}
-    )
-    reply = server.wait_reply(2, DEADLINE)
-    assert not reply["result"].get("isError"), reply
+    env.update(extra_env or {})
+    server = start_server(script, env=env, cwd=tmp_path, stdio=True)
+    try:
+        server.stdio_initialize(DEADLINE)
+        server.stdio_call(
+            2,
+            "program_open",
+            {"binary_path": str(tmp_path / "inputs" / "fast.bin"), "analyze": False},
+        )
+        reply = server.wait_reply(2, DEADLINE)
+        assert not reply["result"].get("isError"), f"{reply}\n{server.stderr}"
+    except BaseException:
+        server.kill()
+        raise
     return server
 
 
 def _assert_closed_after_drain(server: ServerProcess, *names: str) -> None:
-    lines = server.stderr_lines
-    drained = next(i for i, line in enumerate(lines) if "draining running tool calls" in line)
+    drained = server.line_index("draining running tool calls")
     for name in names:
-        closed = next(i for i, line in enumerate(lines) if line == f"PROGRAM_CLOSED {name}")
+        closed = server.line_index(f"PROGRAM_CLOSED {name}")
         assert closed > drained, server.stderr
     assert f"close_all: closing {len(names)} open program(s)" in server.stderr
     assert f"close_all: finished, {len(names)} closed, 0 failed" in server.stderr
@@ -136,10 +150,9 @@ def test_stdio_sigterm_lets_the_running_call_finish_before_close_all(
         server.kill()
     assert status == SIGTERM_STATUS, server.stderr
     assert "SIGTERM received again; shutdown is already in progress" in server.stderr
-    lines = server.stderr_lines
-    finished = lines.index("SLOW_OPEN_FINISHED")
-    assert lines.index("PROGRAM_CLOSED fast.bin") > finished
-    assert lines.index("PROGRAM_CLOSED slow.bin") > finished
+    finished = server.line_index("SLOW_OPEN_FINISHED")
+    assert server.line_index("PROGRAM_CLOSED fast.bin") > finished, server.stderr
+    assert server.line_index("PROGRAM_CLOSED slow.bin") > finished, server.stderr
     _assert_closed_after_drain(server, "fast.bin", "slow.bin")
 
 
@@ -227,9 +240,8 @@ def test_streamable_http_sigterm_drains_and_runs_close_all(
     assert status == SIGTERM_STATUS, server.stderr
     assert "SIGTERM received; stopping the transport" in server.stderr
     if slow:
-        lines = server.stderr_lines
-        finished = lines.index("SLOW_OPEN_FINISHED")
-        assert lines.index("PROGRAM_CLOSED fast.bin") > finished
+        finished = server.line_index("SLOW_OPEN_FINISHED")
+        assert server.line_index("PROGRAM_CLOSED fast.bin") > finished, server.stderr
         _assert_closed_after_drain(server, "fast.bin", "slow.bin")
     else:
         assert elapsed < PROMPT_EXIT
@@ -311,23 +323,59 @@ def test_http_sigterm_handler_unwinds_the_main_thread_with_exit_status_143() -> 
     service.tool_executor.close()
 
 
-def test_sigterm_handler_never_raises_off_the_main_thread() -> None:
-    """The JVM forwards SIGTERM on a Java thread; the handler must only set flags there."""
+def _call_on_another_thread(function: Any, *args: Any) -> Any:
+    """Run function on a fresh non-main thread (like a JVM signal thread); return or raise."""
 
-    service = _service("streamable-http")
-    errors: list[BaseException] = []
+    outcome: dict[str, Any] = {}
 
     def call() -> None:
         try:
-            service._on_sigterm(signal.SIGTERM, None)
+            outcome["result"] = function(*args)
         except BaseException as error:
-            errors.append(error)
+            outcome["error"] = error
 
-    thread = threading.Thread(target=call)
+    thread = threading.Thread(target=call, name="fake-jvm-signal-thread")
     thread.start()
     thread.join(5)
-    assert errors == []
+    assert not thread.is_alive()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
+
+
+@pytest.mark.parametrize("transport", ["stdio", "streamable-http"])
+def test_sigterm_off_the_main_thread_with_nothing_to_stop_is_left_to_the_jvm(
+    transport: str,
+) -> None:
+    """P4: no stdin wrapper to stop (stdio without a stdin fd, or HTTP) on a JVM thread.
+
+    Recording the request there would swallow the signal, because only the main thread can
+    unwind the event loop. The handler must not raise there either; it reports
+    SIGTERM_NOT_HANDLED so the forwarder hands the signal to the JVM's own handler.
+    """
+
+    from ghidra_mcp.runtime import SIGTERM_NOT_HANDLED
+
+    service = _service(transport)
+    assert service._stdin is None
+    result = _call_on_another_thread(service._on_sigterm, signal.SIGTERM, None)
+    assert result is SIGTERM_NOT_HANDLED
+    assert not service._terminate_requested.is_set()
+    service.tool_executor.close()
+
+
+def test_sigterm_off_the_main_thread_stops_the_stdin_wrapper_when_there_is_one() -> None:
+    service = _service("stdio")
+    stopped: list[str] = []
+    service._stdin = types.SimpleNamespace(stop=lambda: stopped.append("stop"))  # type: ignore[assignment]
+    result = _call_on_another_thread(service._on_sigterm, signal.SIGTERM, None)
+    assert result is None
+    assert stopped == ["stop"]
     assert service._terminate_requested.is_set()
+    # During the drain a later SIGTERM is deliberately ignored, not handed to the JVM.
+    assert _call_on_another_thread(service._on_sigterm, signal.SIGTERM, None) is None
+    assert stopped == ["stop"]
+    service._stdin = None
     service.tool_executor.close()
 
 
@@ -354,6 +402,159 @@ def test_run_restores_the_previous_sigterm_handler_and_stdin(tmp_path: Path) -> 
     assert seen["handler"] == service._on_sigterm
     assert signal.getsignal(signal.SIGTERM) is sentinel_handler
     assert sys.stdin is original_stdin
+
+
+def test_run_restores_the_default_when_the_previous_handler_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P5: signal.signal() returns None for a handler installed outside Python."""
+
+    real_signal = signal.signal
+    calls: list[Any] = []
+
+    def fake_signal(signum: int, handler: Any) -> Any:
+        calls.append(handler)
+        real_signal(signum, handler)
+        return None
+
+    class App:
+        def run(self, transport: str) -> None:
+            pass
+
+    from ghidra_mcp.config import Settings
+    from ghidra_mcp.server import GhidraToolExecutor
+    from ghidra_mcp.service import MCPService
+
+    original = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(signal, "signal", fake_signal)
+    service = MCPService(
+        settings=Settings(),
+        app=App(),  # type: ignore[arg-type]
+        workspace=types.SimpleNamespace(close_all=lambda: None),  # type: ignore[arg-type]
+        tool_executor=GhidraToolExecutor(),
+    )
+    try:
+        service.run()
+        assert calls == [service._on_sigterm, signal.SIG_DFL]
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    finally:
+        real_signal(signal.SIGTERM, original)
+
+
+# --------------------------------------------- what run() leaves behind (subprocess)
+
+
+@pytest.mark.parametrize("unknown_previous_handler", [True, False])
+def test_sigterm_after_run_returned_takes_the_default_action(
+    tmp_path: Path, unknown_previous_handler: bool
+) -> None:
+    """P5: once run() is over, SIGTERM must not hit a handler that ignores it forever."""
+
+    server = _start_stdio(
+        tmp_path,
+        script=AFTER_RUN_SCRIPT,
+        extra_env={
+            "HARNESS_UNKNOWN_SIGTERM_HANDLER": "1" if unknown_previous_handler else "0",
+            "HARNESS_AFTER_RUN": "wait_for_signal",
+        },
+    )
+    try:
+        server.close_stdin()
+        server.wait_stderr("WAITING_FOR_SIGNAL", DEADLINE)
+        server.terminate()
+        status = server.wait_exit(PROMPT_EXIT)
+    finally:
+        server.kill()
+    assert server.line_index("RUN_RETURNED") > server.line_index("PROGRAM_CLOSED fast.bin")
+    assert status == -signal.SIGTERM, server.stderr
+    assert "SIGTERM received again" not in server.stderr
+    assert "STILL_ALIVE_AFTER_WAIT" not in server.stderr
+
+
+def test_stdin_is_released_when_the_transport_fails(tmp_path: Path) -> None:
+    """P6: after run() ends with an error, the copying thread must not keep reading fd 0."""
+
+    env = _environment(tmp_path, transport="stdio", workers=1)
+    env.update(HARNESS_APP_RUN_FAILS="1", HARNESS_AFTER_RUN="read_stdin")
+    server = start_server(AFTER_RUN_SCRIPT, env=env, cwd=tmp_path, stdio=True)
+    try:
+        server.send_raw(b"first\n")
+        server.wait_stderr("READING_STDIN", DEADLINE)
+        server.send_raw(b"second\n")
+        server.wait_stderr("AFTER_RUN_READ", DEADLINE)
+        status = server.wait_exit(DEADLINE)
+    finally:
+        server.kill()
+    assert "APP_RUN_READ 'first\\n'" in server.stderr
+    assert "RUN_FAILED RuntimeError" in server.stderr
+    assert "STDIN_PUMP_ALIVE False" in server.stderr
+    assert "AFTER_RUN_READ b'second\\n'" in server.stderr
+    assert status == 0, server.stderr
+
+
+def test_stdin_is_released_when_close_all_fails_after_sigterm(tmp_path: Path) -> None:
+    """P6 via the P3 path: SIGTERM, then close_all raises, so run() ends with an error."""
+
+    server = _start_stdio(
+        tmp_path,
+        script=AFTER_RUN_SCRIPT,
+        extra_env={"HARNESS_FAIL_SAVE": "1", "HARNESS_AFTER_RUN": "read_stdin"},
+    )
+    try:
+        server.terminate()
+        server.wait_stderr("READING_STDIN", DEADLINE)
+        server.send_raw(b"second\n")
+        server.wait_stderr("AFTER_RUN_READ", DEADLINE)
+        status = server.wait_exit(DEADLINE)
+    finally:
+        server.kill()
+    assert "close_all: finished, 0 closed, 1 failed" in server.stderr
+    assert "RUN_FAILED RuntimeError" in server.stderr
+    assert "STDIN_PUMP_ALIVE False" in server.stderr
+    assert "AFTER_RUN_READ b'second\\n'" in server.stderr
+    assert status == 0, server.stderr
+
+
+_FAKE_RICH_LOGGING = """
+import logging
+import sys
+
+
+class RichHandler(logging.Handler):
+    # Stand-in for rich.logging.RichHandler: decorates and wraps every record.
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def emit(self, record):
+        text = self.format(record)
+        for start in range(0, len(text), 24):
+            print("[rich] " + text[start : start + 24], file=sys.stderr, flush=True)
+"""
+
+
+def test_harness_log_lines_stay_plain_when_rich_is_installed(tmp_path: Path) -> None:
+    """P8: FastMCP would install a RichHandler (wrapped lines) if rich were importable."""
+
+    fake_rich = tmp_path / "fake-rich" / "rich"
+    fake_rich.mkdir(parents=True)
+    (fake_rich / "__init__.py").write_text("", encoding="utf-8")
+    (fake_rich / "console.py").write_text(
+        "class Console:\n    def __init__(self, *args, **kwargs):\n        pass\n",
+        encoding="utf-8",
+    )
+    (fake_rich / "logging.py").write_text(_FAKE_RICH_LOGGING, encoding="utf-8")
+    python_path = os.pathsep.join(
+        part for part in (str(fake_rich.parent), os.environ.get("PYTHONPATH")) if part
+    )
+    server = _start_stdio(tmp_path, extra_env={"PYTHONPATH": python_path})
+    try:
+        server.close_stdin()
+        status = server.wait_exit(DEADLINE)
+    finally:
+        server.kill()
+    assert status == 0, server.stderr
+    assert "[rich]" not in server.stderr
+    _assert_closed_after_drain(server, "fast.bin")
 
 
 # ----------------------------------------------------------------- JVM start-up
@@ -538,6 +739,21 @@ def test_jvm_sigterm_forwarder_respects_python_default_and_ignore(
     forwarder.handle("SIGTERM")
 
     assert fake_jpype.previous_calls == (["SIGTERM"] if expect_previous else [])
+
+
+def test_jvm_sigterm_forwarder_hands_an_unhandled_sigterm_to_the_jvm(
+    fake_jpype: _FakeJavaSignalApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P4 end to end through the forwarder: stdio service without a stdin fd, JVM started."""
+
+    service = _service("stdio")
+    monkeypatch.setattr(signal, "getsignal", lambda _: service._on_sigterm)
+    forwarder = _install_forwarder(fake_jpype)
+
+    _call_on_another_thread(forwarder.handle, "SIGTERM")
+
+    assert fake_jpype.previous_calls == ["SIGTERM"]
+    service.tool_executor.close()
 
 
 def test_jvm_sigterm_forwarder_falls_back_to_the_jvm_when_the_python_handler_fails(

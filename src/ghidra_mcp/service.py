@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import queue
+import select
 import signal
 import sys
 import threading
@@ -24,7 +25,7 @@ from .config import (
     normalize_http_public_url,
     validate_http_auth_token,
 )
-from .runtime import GhidraRuntime, ProgramWorkspace
+from .runtime import SIGTERM_NOT_HANDLED, GhidraRuntime, ProgramWorkspace
 from .server import GhidraToolExecutor, create_mcp_app
 
 
@@ -43,10 +44,13 @@ class _InterruptibleStdin(io.RawIOBase):
     client keeps stdin open. A daemon thread copies fd 0 into a bounded queue instead;
     ``stop()`` makes the reader see EOF at once, which takes the same graceful path as a
     real stdin EOF. The copying thread is a daemon, so a read that never returns cannot
-    block interpreter exit.
+    block interpreter exit. Where ``select.poll`` exists it waits for input in short polls
+    before each read, so after ``release()`` it stops reading fd 0 instead of taking the
+    next chunk meant for whoever reads stdin after ``MCPService.run`` returns.
     """
 
     _CHUNK_SIZE = 64 * 1024
+    _POLL_SECONDS = 0.25
 
     def __init__(self, fd: int, *, max_chunks: int = 64) -> None:
         super().__init__()
@@ -62,6 +66,8 @@ class _InterruptibleStdin(io.RawIOBase):
     def _copy(self) -> None:
         try:
             while not self._ended.is_set():
+                if not self._wait_readable():
+                    continue
                 chunk = os.read(self._fd, self._CHUNK_SIZE)
                 if not chunk:
                     break
@@ -76,11 +82,30 @@ class _InterruptibleStdin(io.RawIOBase):
         finally:
             self._end()
 
+    def _wait_readable(self) -> bool:
+        """Wait briefly for input (or EOF) on fd 0; True when a read will not block."""
+
+        if not hasattr(select, "poll"):
+            return True
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)
+        return bool(poller.poll(self._POLL_SECONDS * 1000))
+
     def stop(self) -> None:
         """Make readers see EOF now, dropping input not yet read. Safe from any thread."""
 
         self._stopped = True
         self._end()
+
+    def release(self) -> None:
+        """Stop, then wait for the copying thread to end so it no longer reads fd 0.
+
+        Without ``select.poll`` the thread may stay blocked in read(); it is not waited for.
+        """
+
+        self.stop()
+        if hasattr(select, "poll"):
+            self._pump.join(4 * self._POLL_SECONDS)
 
     def _end(self) -> None:
         self._ended.set()
@@ -158,25 +183,38 @@ class MCPService:
         if self._terminate_requested.is_set():
             raise SystemExit(_SIGTERM_EXIT_STATUS)
 
-    def _on_sigterm(self, signum: int, _frame: Any) -> None:
-        """SIGTERM handler; also called on a JVM signal thread once the JVM owns SIGTERM."""
+    def _on_sigterm(self, signum: int, _frame: Any) -> Any:
+        """SIGTERM handler; also called on a JVM signal thread once the JVM owns SIGTERM.
+
+        Returns ``SIGTERM_NOT_HANDLED`` when called off the main thread with no transport it
+        can stop, so the JVM forwarder falls back to the JVM's own SIGTERM handler.
+        """
 
         if self._draining.is_set() or self._terminate_requested.is_set():
             _LOGGER.warning("SIGTERM received again; shutdown is already in progress")
-            return
+            return None
+        if self._stdin is None and threading.current_thread() is not threading.main_thread():
+            # A JVM signal thread, and nothing this thread can stop: stdio whose sys.stdin
+            # has no file descriptor (embedded use), or a forwarded SIGTERM outside uvicorn's
+            # serve window. Only the main thread can unwind the event loop, and
+            # _thread.interrupt_main() does not wake a loop idle in select(), so recording
+            # the request here would swallow the signal. The JVM's handler takes it instead:
+            # Java shutdown hooks run and the process exits 143, without drain or close_all.
+            _LOGGER.warning(
+                "SIGTERM received on a JVM thread with no transport to stop; "
+                "leaving it to the JVM (no drain, no close_all)"
+            )
+            return SIGTERM_NOT_HANDLED
         self._terminate_requested.set()
         _LOGGER.warning("SIGTERM received; stopping the transport, then draining running calls")
         if self._stdin is not None:
             self._stdin.stop()
-        elif threading.current_thread() is threading.main_thread():
-            # streamable-http: uvicorn handles SIGTERM itself while serving and re-raises it
-            # afterwards; this handler sees it then, or before uvicorn has started serving.
-            # Also stdio when stdin has no file descriptor to wrap. SystemExit unwinds the
-            # event loop; the finally block in run() still drains and runs close_all.
-            # (Off the main thread this branch only records the request: in HTTP mode the
-            # JVM forwards SIGTERM only while uvicorn serves, and then it reaches uvicorn's
-            # handler, never this one.)
-            raise SystemExit(_SIGTERM_EXIT_STATUS)
+            return None
+        # Main thread. streamable-http: uvicorn handles SIGTERM itself while serving and
+        # re-raises it afterwards; this handler sees it then, or before uvicorn has started
+        # serving. Also stdio when stdin has no file descriptor to wrap. SystemExit unwinds
+        # the event loop; the finally block in run() still drains and runs close_all.
+        raise SystemExit(_SIGTERM_EXIT_STATUS)
 
     @contextmanager
     def _sigterm_handling(self) -> Iterator[None]:
@@ -195,10 +233,17 @@ class MCPService:
             yield
         finally:
             sys.stdin = previous_stdin
+            if self._stdin is not None:
+                # After an error in run() the copying thread would otherwise keep reading fd 0.
+                self._stdin.release()
             self._stdin = None
-            # None means the previous handler was not installed from Python; leave ours.
-            if previous_handler is not None:
-                signal.signal(signal.SIGTERM, previous_handler)
+            # None means the previous handler was installed outside Python and cannot be
+            # restored. Leaving ours would ignore every later SIGTERM (_draining stays set),
+            # so fall back to the default disposition.
+            signal.signal(
+                signal.SIGTERM,
+                signal.SIG_DFL if previous_handler is None else previous_handler,
+            )
 
 
 def create_service(settings: Settings, *, pyghidra_module: Any | None = None) -> MCPService:

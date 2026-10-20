@@ -12,12 +12,15 @@ from pathlib import Path
 import signal
 import sys
 import time
+from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from shutdown_harness import (  # noqa: E402
+    CLI_AFTER_RUN_SCRIPT,
+    CLI_NO_STDIN_FD_SCRIPT,
     CLI_SCRIPT,
     TEST_TOKEN,
     free_port,
@@ -40,14 +43,17 @@ def _require_ghidra() -> str:
     return install_value
 
 
-def _stdio_server_with_open_program(tmp_path: Path) -> object:
+def _stdio_server_with_open_program(
+    tmp_path: Path, *, script: str = CLI_SCRIPT, extra_env: dict[str, str] | None = None
+) -> Any:
     install_dir = _require_ghidra()
     server = start_server(
-        CLI_SCRIPT,
+        script,
         env={
             "GHIDRA_INSTALL_DIR": install_dir,
             "GHIDRA_MCP_TRANSPORT": "stdio",
             "GHIDRA_MCP_STORAGE_ROOT": str(tmp_path / "projects"),
+            **(extra_env or {}),
         },
         cwd=tmp_path,
         stdio=True,
@@ -151,3 +157,67 @@ def test_real_jvm_streamable_http_sigterm_runs_close_all(tmp_path: Path) -> None
     assert status == 128 + signal.SIGTERM, server.stderr
     assert elapsed < EXIT_BUDGET
     assert "close_all: finished, 1 closed, 0 failed" in server.stderr
+
+
+@pytest.mark.integration
+def test_real_jvm_sigterm_without_a_stdin_fd_is_left_to_the_jvm(tmp_path: Path) -> None:
+    """P4: embedded-style stdio (sys.stdin has no fd) after the JVM started.
+
+    The JVM signal thread has nothing it can stop, so the forwarder must fall back to the
+    JVM's own handler (exit 143, no drain) instead of swallowing the signal.
+    """
+
+    server = _stdio_server_with_open_program(tmp_path, script=CLI_NO_STDIN_FD_SCRIPT)
+    try:
+        server.terminate()
+        status = server.wait_exit(EXIT_BUDGET)
+    finally:
+        server.kill()
+    assert status == 128 + signal.SIGTERM, f"SIGTERM swallowed (status {status}):\n{server.stderr}"
+    assert "SIGTERM received on a JVM thread with no transport to stop" in server.stderr
+    assert "close_all:" not in server.stderr
+
+
+@pytest.mark.integration
+def test_real_jvm_sigterm_after_run_returned_takes_the_default_action(tmp_path: Path) -> None:
+    """P5: the replaced handler looks foreign (None); SIGTERM after run() must still kill."""
+
+    server = _stdio_server_with_open_program(
+        tmp_path,
+        script=CLI_AFTER_RUN_SCRIPT,
+        extra_env={
+            "HARNESS_UNKNOWN_SIGTERM_HANDLER": "1",
+            "HARNESS_AFTER_RUN": "wait_for_signal",
+        },
+    )
+    try:
+        server.close_stdin()
+        server.wait_stderr("WAITING_FOR_SIGNAL", EXIT_BUDGET)
+        server.terminate()
+        status = server.wait_exit(EXIT_BUDGET)
+    finally:
+        server.kill()
+    assert "close_all: finished, 1 closed, 0 failed" in server.stderr
+    assert status == -signal.SIGTERM, f"status {status}:\n{server.stderr}"
+    assert "SIGTERM received again" not in server.stderr
+
+
+@pytest.mark.integration
+def test_real_jvm_stdin_is_released_after_a_sigterm_shutdown(tmp_path: Path) -> None:
+    """P6: run() ends with SystemExit(143); nothing may keep reading fd 0 afterwards."""
+
+    server = _stdio_server_with_open_program(
+        tmp_path, script=CLI_AFTER_RUN_SCRIPT, extra_env={"HARNESS_AFTER_RUN": "read_stdin"}
+    )
+    try:
+        server.terminate()
+        server.wait_stderr("READING_STDIN", EXIT_BUDGET)
+        server.send_raw(b"second\n")
+        server.wait_stderr("AFTER_RUN_READ", EXIT_BUDGET)
+        server.wait_exit(EXIT_BUDGET)
+    finally:
+        server.kill()
+    assert "close_all: finished, 1 closed, 0 failed" in server.stderr
+    assert "RUN_FAILED SystemExit" in server.stderr
+    assert "STDIN_PUMP_ALIVE False" in server.stderr
+    assert "AFTER_RUN_READ b'second\\n'" in server.stderr

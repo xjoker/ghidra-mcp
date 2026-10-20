@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: a stdio server that had started the JVM (for example after `program_open`) no longer stays alive after stdin EOF. The JVM was created on a tool worker thread that ended without detaching, so JPype's `DestroyJavaVM` at interpreter exit waited for it forever; the JVM is now started on a short-lived helper thread that detaches before it ends.
+- Fixed: SIGTERM (including `docker stop`) now runs the same shutdown as stdin EOF in both stdio and Streamable HTTP mode: stop the transport, let running tool calls finish, then `close_all` saves and closes every open program. Previously the JVM's own SIGTERM handler (or, before the JVM started, the default action or uvicorn's re-raised signal) ended the process without `close_all`, so with several workers more than one program could be cut off mid-transaction or mid-save. The process still exits with status 143 after a SIGTERM; a second SIGTERM during the drain is logged and ignored, and the drain has no time limit (SIGKILL still interrupts it). Shutdown progress is logged (`close_all: closing N open program(s)` / `close_all: finished, …`).
 - The error returned to MCP clients when the configured Ghidra is older than the minimum supported version no longer includes the absolute Ghidra installation directory; it reports only the detected version, the minimum version, the reason, and upgrade guidance. The installation directory is written to the server log (logger `ghidra_mcp.runtime`) instead, so remote Streamable HTTP clients no longer learn host filesystem paths from this error.
 
 ## 20261019.2

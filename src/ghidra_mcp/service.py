@@ -68,6 +68,9 @@ class _InterruptibleStdin(io.RawIOBase):
             while not self._ended.is_set():
                 if not self._wait_readable():
                     continue
+                if self._ended.is_set():
+                    # stop()/release() ran during the poll: leave the input for the next reader.
+                    break
                 chunk = os.read(self._fd, self._CHUNK_SIZE)
                 if not chunk:
                     break

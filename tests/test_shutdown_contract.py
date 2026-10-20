@@ -297,6 +297,55 @@ def test_interruptible_stdin_stop_unblocks_a_reader_while_the_writer_stays_open(
         os.close(read_fd)
 
 
+def test_interruptible_stdin_leaves_input_that_arrives_during_the_last_poll_in_fd_0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Input written after release() while the copying thread is still in a poll stays in fd 0.
+
+    The first poll is gated so the order is fixed: the copying thread is inside the poll,
+    then stop() runs, then input arrives, and only then does the poll report it readable.
+    """
+
+    import select
+
+    from ghidra_mcp.service import _InterruptibleStdin
+
+    if not hasattr(select, "poll"):
+        pytest.skip("needs select.poll")
+    in_first_poll = threading.Event()
+    let_poll_return = threading.Event()
+    real_wait_readable = _InterruptibleStdin._wait_readable
+    gated = [True]
+
+    def gated_wait_readable(self: Any) -> bool:
+        if gated[0]:
+            gated[0] = False
+            in_first_poll.set()
+            assert let_poll_return.wait(DEADLINE)
+        return real_wait_readable(self)
+
+    monkeypatch.setattr(_InterruptibleStdin, "_wait_readable", gated_wait_readable)
+    read_fd, write_fd = os.pipe()
+    try:
+        raw = _InterruptibleStdin(read_fd)
+        assert in_first_poll.wait(DEADLINE)
+        raw.stop()
+        os.write(write_fd, b'{"next_reader": 1}\n')
+        let_poll_return.set()
+        raw.release()
+        assert not raw._pump.is_alive()
+        os.set_blocking(read_fd, False)
+        try:
+            left_in_fd = os.read(read_fd, 1024)
+        except BlockingIOError:
+            left_in_fd = b""
+        assert left_in_fd == b'{"next_reader": 1}\n'
+    finally:
+        let_poll_return.set()
+        os.close(write_fd)
+        os.close(read_fd)
+
+
 # ------------------------------------------------------------- handler semantics
 
 

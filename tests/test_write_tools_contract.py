@@ -20,9 +20,33 @@ class FakeAddress(str):
 @dataclass
 class FakeFlowType:
     call: bool = False
+    computed: bool = False
 
     def isCall(self) -> bool:
         return self.call
+
+    def isComputed(self) -> bool:
+        return self.computed
+
+
+@dataclass
+class FakeReferenceType:
+    call: bool
+
+    def isCall(self) -> bool:
+        return self.call
+
+
+@dataclass
+class FakeReference:
+    to: str
+    call: bool
+
+    def getToAddress(self) -> FakeAddress:
+        return FakeAddress(self.to)
+
+    def getReferenceType(self) -> FakeReferenceType:
+        return FakeReferenceType(self.call)
 
 
 @dataclass
@@ -34,6 +58,13 @@ class FakeInstruction:
     fall_through: str | None = None
     flows: tuple[str, ...] = ()
     call: bool = False
+    # Indirect (computed) flow, operand addresses (None for a register operand), references
+    # from the instruction as (to, is_call), and Ghidra's fall-through marks.
+    computed: bool = False
+    operands: tuple[str | None, ...] = ()
+    references: tuple[tuple[str, bool], ...] = ()
+    has_fallthrough: bool | None = None
+    flow_override: str = "NONE"
 
     def getMinAddress(self) -> FakeAddress:
         return FakeAddress(self.start)
@@ -48,7 +79,60 @@ class FakeInstruction:
         return [FakeAddress(flow) for flow in self.flows]
 
     def getFlowType(self) -> FakeFlowType:
-        return FakeFlowType(self.call)
+        return FakeFlowType(self.call, self.computed)
+
+    def getNumOperands(self) -> int:
+        return len(self.operands)
+
+    def getAddress(self, operand: int) -> FakeAddress | None:
+        value = self.operands[operand]
+        return None if value is None else FakeAddress(value)
+
+    def getReferencesFrom(self) -> list[FakeReference]:
+        return [FakeReference(to, call) for to, call in self.references]
+
+    def hasFallthrough(self) -> bool:
+        if self.has_fallthrough is None:
+            return self.fall_through is not None
+        return self.has_fallthrough
+
+    def getFlowOverride(self) -> str:
+        return self.flow_override
+
+
+class FakeMemory:
+    """Program memory as {address: bytes}; reads record (kind, address, big_endian)."""
+
+    def __init__(self, program: "FakeProgram") -> None:
+        self.program = program
+
+    def isBigEndian(self) -> bool:
+        return self.program.big_endian
+
+    def _read(self, kind: str, address: str, size: int, big_endian: bool) -> int:
+        self.program.memory_reads.append((kind, str(address), big_endian))
+        raw = self.program.memory_bytes.get(str(address))
+        if raw is None or len(raw) < size:
+            raise RuntimeError("MemoryAccessException")
+        return int.from_bytes(raw[:size], "big" if big_endian else "little", signed=True)
+
+    def getLong(self, address: str, big_endian: bool) -> int:
+        return self._read("long", address, 8, big_endian)
+
+    def getInt(self, address: str, big_endian: bool) -> int:
+        return self._read("int", address, 4, big_endian)
+
+
+class FakeAddressSpace:
+    def getAddress(self, offset: int) -> FakeAddress:
+        if offset < 0:
+            raise RuntimeError("AddressOutOfBoundsException")
+        return FakeAddress(f"{offset:08x}")
+
+
+class FakeAddressFactory:
+    def getDefaultAddressSpace(self) -> FakeAddressSpace:
+        return FakeAddressSpace()
 
 
 class FakePseudoDisassembler:
@@ -94,6 +178,20 @@ class FakeProgram:
         self.pseudo: dict[str, FakeInstruction] = {}
         self.undecodable: set[str] = set()
         self.pseudo_requests: list[str] = []
+        # Memory behind indirect calls (see FakeMemory).
+        self.memory_bytes: dict[str, bytes] = {}
+        self.memory_reads: list[tuple[str, str, bool]] = []
+        self.pointer_size = 8
+        self.big_endian = False
+
+    def getMemory(self) -> FakeMemory:
+        return FakeMemory(self)
+
+    def getDefaultPointerSize(self) -> int:
+        return self.pointer_size
+
+    def getAddressFactory(self) -> FakeAddressFactory:
+        return FakeAddressFactory()
 
     def startTransaction(self, description: str) -> int:
         self.events.append(("start", description))
@@ -136,6 +234,10 @@ class FakeFunction:
     entry: str = "00400010"
     fail_rename: bool = False
     body: "FakeBody | None" = None
+    noreturn: bool = False
+
+    def hasNoReturn(self) -> bool:
+        return self.noreturn
 
     def getName(self) -> str:
         return self.name
@@ -209,6 +311,9 @@ class FakeFunctionManager:
 
     def getFunctionAt(self, address: str) -> "FakeFunction | None":
         return self.api.getFunctionAt(address)
+
+    def getFunctionContaining(self, address: str) -> "FakeFunction | None":
+        return self.api.getFunctionContaining(address)
 
     def getFunctionsOverlapping(self, body: FakeBody) -> FakeIterator:
         functions = [self.api.function] if self.api.function is not None else []
@@ -626,12 +731,13 @@ def test_function_create_rejects_an_undisassembled_entry_whose_flow_reaches_a_fu
         (
             {
                 "00400000": FakeInstruction(
-                    "00400000", "00400004", fall_through="00400005", flows=("00400014",), call=True
-                )
+                    "00400000", "00400004", fall_through="00400005", flows=("00400050",), call=True
+                ),
+                "00400050": FakeInstruction("00400050", "00400050", flows=("00400011",)),
             },
             (),
             (),
-            "00400014",
+            "00400050",
         ),
         (
             {"00400000": FakeInstruction("00400000", "00400003", fall_through="00400004")},
@@ -710,3 +816,206 @@ def test_function_create_rejects_a_predicted_body_over_the_instruction_limit(
         tools["function_create"]("program-1", "00400030", "huge")
 
     assert workspace.api.program.events == []
+
+
+def _call(target: str | None = None, **kwargs: object) -> FakeInstruction:
+    """A five-byte call at 00400000 that falls through to 00400005."""
+    flows = () if target is None else (target,)
+    return FakeInstruction(
+        "00400000", "00400004", fall_through="00400005", flows=flows, call=True, **kwargs
+    )
+
+
+MIDDLE = "00400011"  # inside FUN_00400010 (00400010-0040001f), not its entry
+CALL_INTO_MIDDLE = (
+    "新函数中的调用目标位于已有函数 FUN_00400010（入口 00400010）的函数体中部：00400000"
+)
+
+
+@pytest.mark.parametrize(
+    ("instructions", "memory", "pointer_size", "big_endian"),
+    [
+        ({"00400000": _call(MIDDLE)}, {}, 8, False),
+        (
+            {"00400000": _call(computed=True, operands=("00400040",))},
+            {"00400040": (0x00400011).to_bytes(8, "little")},
+            8,
+            False,
+        ),
+        (
+            {"00400000": _call(computed=True, operands=("00400040",))},
+            {"00400040": (0x00400011).to_bytes(4, "big") + b"\xff\xff\xff\xff"},
+            4,
+            True,
+        ),
+        ({"00400000": _call(computed=True, references=((MIDDLE, True),))}, {}, 8, False),
+        (
+            {
+                "00400000": FakeInstruction(
+                    "00400000", "00400001", fall_through="00400002", flows=("00400008",)
+                ),
+                "00400002": FakeInstruction(
+                    "00400002", "00400006", fall_through="00400007", flows=(MIDDLE,), call=True
+                ),
+            },
+            {},
+            8,
+            False,
+        ),
+    ],
+    ids=[
+        "direct-call",
+        "indirect-via-64-bit-little-endian-pointer",
+        "indirect-via-32-bit-big-endian-pointer",
+        "indirect-via-listing-call-reference",
+        "conditional-branch-then-call",
+    ],
+)
+def test_function_create_rejects_a_call_into_the_middle_of_a_function(
+    monkeypatch: pytest.MonkeyPatch,
+    instructions: dict[str, FakeInstruction],
+    memory: dict[str, bytes],
+    pointer_size: int,
+    big_endian: bool,
+) -> None:
+    # Review round 2 N1: analysis creates a function at every call target, so a call into the
+    # middle of an existing function would later split it, although the call is not followed.
+    workspace = FakeWorkspace()
+    program = workspace.api.program
+    program.pseudo.update(instructions)
+    program.memory_bytes.update(memory)
+    program.pointer_size = pointer_size
+    program.big_endian = big_endian
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError) as raised:
+        tools["function_create"]("program-1", "00400000", "calls_into_middle")
+
+    assert str(raised.value) == CALL_INTO_MIDDLE
+    assert MIDDLE not in program.pseudo_requests, "the callee must not be disassembled"
+    assert program.events == []
+    if memory:
+        kind = "long" if pointer_size == 8 else "int"
+        assert program.memory_reads == [(kind, "00400040", big_endian)]
+
+
+@pytest.mark.parametrize(
+    ("call", "memory"),
+    [
+        (_call("00400010"), {}),
+        (_call("00400050"), {}),
+        (_call(computed=True, operands=(None,)), {}),
+        (_call(computed=True, operands=("00400040",)), {}),
+        (_call(computed=True, operands=("00400040",)), {"00400040": b"\xff" * 8}),
+        (_call(computed=True, references=((MIDDLE, False),)), {}),
+        (
+            _call("00400050", operands=("00400050",)),
+            {"00400050": (0x00400011).to_bytes(8, "little")},
+        ),
+    ],
+    ids=[
+        "target-is-a-function-entry",
+        "target-outside-every-function-is-not-followed",
+        "unresolvable-register-call",
+        "unreadable-pointer",
+        "pointer-out-of-the-address-space",
+        "non-call-reference-ignored",
+        "direct-call-target-is-not-read-as-a-pointer",
+    ],
+)
+def test_function_create_allows_calls_that_cannot_split_a_function(
+    monkeypatch: pytest.MonkeyPatch, call: FakeInstruction, memory: dict[str, bytes]
+) -> None:
+    # An unresolvable indirect target is allowed: a known limit, documented on function_create.
+    workspace = FakeWorkspace()
+    program = workspace.api.program
+    program.pseudo["00400000"] = call
+    program.memory_bytes.update(memory)
+    tools = _tools(workspace, monkeypatch)
+
+    assert tools["function_create"]("program-1", "00400000", "caller")["entry_point"] == "00400000"
+    assert _created(workspace) == [("create", "00400000", "caller")]
+    assert "00400050" not in program.pseudo_requests, "calls are not followed into the callee"
+    assert "00400005" in program.pseudo_requests, "a returning call falls through"
+
+
+@pytest.mark.parametrize(
+    ("call", "noreturn", "stops"),
+    [
+        (_call("00400010"), True, True),
+        (_call("00400010"), False, False),
+        (_call("00400050", flow_override="CALL_RETURN"), False, True),
+        (_call("00400050", flow_override="RETURN"), False, True),
+        (_call("00400050", has_fallthrough=False), False, True),
+        (_call("00400050", flow_override="CALL"), False, False),
+    ],
+    ids=[
+        "noreturn-callee",
+        "returning-callee-control",
+        "flow-override-call-return",
+        "flow-override-return",
+        "no-fallthrough-mark",
+        "other-override-control",
+    ],
+)
+def test_function_create_does_not_follow_the_fall_through_of_a_call_that_does_not_return(
+    monkeypatch: pytest.MonkeyPatch, call: FakeInstruction, noreturn: bool, stops: bool
+) -> None:
+    # Review round 2 N2: after `call exit` the next bytes are not code of this function, so a
+    # jmp there into FUN_00400010 must not cause a rejection.
+    workspace = FakeWorkspace()
+    program = workspace.api.program
+    assert workspace.api.function is not None
+    workspace.api.function.noreturn = noreturn
+    program.pseudo["00400000"] = call
+    program.pseudo["00400005"] = FakeInstruction("00400005", "00400009", flows=(MIDDLE,))
+    tools = _tools(workspace, monkeypatch)
+
+    if stops:
+        assert tools["function_create"]("program-1", "00400000", "dies")["entry_point"] == (
+            "00400000"
+        )
+        assert "00400005" not in program.pseudo_requests
+    else:
+        with pytest.raises(ToolInputError) as raised:
+            tools["function_create"]("program-1", "00400000", "dies")
+        assert str(raised.value) == (
+            "新函数体将与已有函数 FUN_00400010（入口 00400010）重叠：00400000"
+        )
+
+
+def _straight_line(count: int) -> dict[str, FakeInstruction]:
+    """``count`` one-byte instructions from 00400100, each falling through to the next."""
+    start = 0x00400100
+    chain = {}
+    for index in range(count):
+        address = f"{start + index:08x}"
+        following = None if index == count - 1 else f"{start + index + 1:08x}"
+        chain[address] = FakeInstruction(address, address, fall_through=following)
+    return chain
+
+
+@pytest.mark.parametrize(("count", "allowed"), [(20_000, True), (20_001, False)])
+def test_function_create_pins_the_predicted_instruction_limit(
+    monkeypatch: pytest.MonkeyPatch, count: int, allowed: bool
+) -> None:
+    # Review round 2 N3: exactly 20,000 predicted instructions are allowed, one more is not.
+    from ghidra_mcp.tools import writes
+
+    assert writes._MAX_PREDICTED_INSTRUCTIONS == 20_000
+    workspace = FakeWorkspace()
+    workspace.api.program.pseudo.update(_straight_line(count))
+    tools = _tools(workspace, monkeypatch)
+
+    if allowed:
+        assert tools["function_create"]("program-1", "00400100", "long")["entry_point"] == (
+            "00400100"
+        )
+        assert len(workspace.api.program.pseudo_requests) == count
+    else:
+        with pytest.raises(
+            ToolInputError, match="^从入口推算的函数体超过指令数上限，拒绝创建：00400100$"
+        ):
+            tools["function_create"]("program-1", "00400100", "long")
+        assert len(workspace.api.program.pseudo_requests) == 20_001
+        assert workspace.api.program.events == []

@@ -224,3 +224,136 @@ def test_real_function_create_on_undisassembled_bytes_cannot_carve_a_function_la
         tools["program_close"](reopened)
     finally:
         workspace.close_all()
+
+
+_BLOCK = 0x300000
+_VICTIM = 0x100
+_MIDDLE = _VICTIM + 0x09  # an instruction boundary (a nop) in the middle of V
+_NORETURN = 0x300
+
+
+def _rel32(at: int, size: int, to: int) -> bytes:
+    import struct
+
+    return struct.pack("<i", to - (at + size))
+
+
+def _call_layout() -> dict[int, bytes]:
+    """Code at 0x300000 + offset; everything else in the block is int3 (0xcc)."""
+    import struct
+
+    middle = _BLOCK + _MIDDLE
+    return {
+        # V: push rbp; mov rbp,rsp; mov eax,imm32; 11 nops; pop rbp; ret (0x100-0x115).
+        _VICTIM: b"\x55\x48\x89\xe5" + b"\xb8\x90\x90\x90\x90" + b"\x90" * 11 + b"\x5d\xc3",
+        # direct: call <middle of V>; ret
+        0x000: b"\xe8" + _rel32(_BLOCK, 5, middle) + b"\xc3",
+        # indirect: call qword ptr [rip+disp] -> pointer at 0x080 (undefined bytes); ret
+        0x010: b"\xff\x15" + struct.pack("<i", 0x080 - (0x010 + 6)) + b"\xc3",
+        0x080: struct.pack("<Q", middle),
+        # conditional: test edi,edi; jz +5; call <middle of V>; ret
+        0x020: b"\x85\xff\x74\x05" + b"\xe8" + _rel32(_BLOCK + 0x024, 5, middle) + b"\xc3",
+        # noreturn (review N2): call N; jmp <middle of V>, never reached because N does not return
+        0x040: b"\xe8"
+        + _rel32(_BLOCK + 0x040, 5, _BLOCK + _NORETURN)
+        + b"\xe9"
+        + _rel32(_BLOCK + 0x045, 5, middle),
+        # control: call <V's entry>; ret
+        0x060: b"\xe8" + _rel32(_BLOCK + 0x060, 5, _BLOCK + _VICTIM) + b"\xc3",
+        # N: hlt; ret, marked noreturn
+        _NORETURN: b"\xf4\xc3",
+    }
+
+
+@pytest.mark.integration
+def test_real_function_create_checks_call_targets_without_following_calls(
+    tmp_path: Path,
+) -> None:
+    # Review round 2 N1: an entry on undisassembled bytes that calls into the middle of V is
+    # created, and the next analysis_run creates a function at the call target and splits V.
+    # N2: a call to a noreturn function, followed by bytes that jump into V, must stay allowed.
+    install_value = os.environ.get("GHIDRA_INSTALL_DIR")
+    if not install_value:
+        pytest.skip("GHIDRA_INSTALL_DIR 未配置")
+    if not FIXTURE.is_file():
+        pytest.skip("先运行 scripts/build_fixtures.py")
+
+    workspace = ProgramWorkspace(
+        GhidraRuntime(Path(install_value)), project_location=tmp_path / "projects"
+    )
+    tools = {tool.name: tool.handler for tool in build_default_registry(workspace).enabled_tools()}
+    try:
+        program_id = tools["program_open"](str(FIXTURE), analyze=True)["program_id"]
+        api = workspace.get(program_id)
+        program = api.getCurrentProgram()
+        from ghidra.app.cmd.disassemble import DisassembleCommand
+        from ghidra.util.task import TaskMonitor
+
+        def at(offset: int) -> object:
+            return api.toAddr(_BLOCK + offset)
+
+        raw = bytearray(b"\xcc" * 0x1000)
+        for offset, code in _call_layout().items():
+            raw[offset : offset + len(code)] = code
+        transaction = program.startTransaction("test setup: synthetic code block")
+        try:
+            memory = program.getMemory()
+            block = memory.createInitializedBlock(
+                "probe", at(0), 0x1000, 0, TaskMonitor.DUMMY, False
+            )
+            block.setExecute(True)
+            memory.setBytes(at(0), bytes(raw))
+            for offset in (_VICTIM, _NORETURN):
+                DisassembleCommand(at(offset), None, True).applyTo(program, TaskMonitor.DUMMY)
+            api.createFunction(at(_VICTIM), "V")
+            api.createFunction(at(_NORETURN), "N").setNoReturn(True)
+        finally:
+            program.endTransaction(transaction, True)
+        workspace.save(program_id)
+        tools["analysis_run"](program_id)
+        victim = str(at(_VICTIM))
+        victim_body = _ranges(workspace, program_id, victim)
+        assert victim_body == [(victim, str(at(_VICTIM + 0x15)))]
+        entries = {"direct": 0x000, "indirect": 0x010, "conditional": 0x020}
+        allowed = {"noreturn": 0x040, "control": 0x060}
+        for offset in [*entries.values(), *allowed.values()]:
+            assert api.getInstructionAt(at(offset)) is None, "entries must be undisassembled"
+        before = _all_bodies(workspace, program_id)
+
+        # 1. A call whose target is inside V (not its entry) is rejected: direct, through a
+        #    pointer in memory, and behind a conditional branch. The check writes nothing.
+        for name, offset in entries.items():
+            address = str(at(offset))
+            with pytest.raises(ToolInputError) as rejected:
+                tools["function_create"](program_id, address, f"n1_{name}")
+            assert str(rejected.value) == (
+                f"新函数中的调用目标位于已有函数 V（入口 {victim}）的函数体中部：{address}"
+            ), name
+            assert api.getInstructionAt(at(offset)) is None, "the check must not disassemble"
+        assert _all_bodies(workspace, program_id) == before
+
+        # 2. A call to V's entry, and a noreturn call whose dead fall-through jumps into V, are
+        #    allowed: calls are not followed into the callee, and nothing after N is reached.
+        for name, offset in allowed.items():
+            address = str(at(offset))
+            created = tools["function_create"](program_id, address, f"ok_{name}")
+            assert created == {"name": f"ok_{name}", "entry_point": address}
+
+        # 3. Analysis afterwards does not touch V (no function at the middle), also after reopen.
+        tools["analysis_run"](program_id)
+        after = _all_bodies(workspace, program_id)
+        for offset in allowed.values():
+            assert after.pop(str(at(offset)))[0][0] == str(at(offset))
+        assert after == before
+        assert _containing(workspace, program_id, str(at(_MIDDLE))) == victim
+        tools["program_close"](program_id)
+        reopened = tools["program_open"](str(FIXTURE), analyze=False)["program_id"]
+        assert _ranges(workspace, reopened, victim) == victim_body
+        assert workspace.get(reopened).getFunctionAt(at(_MIDDLE)) is None
+        reopened_bodies = _all_bodies(workspace, reopened)
+        for offset in allowed.values():
+            reopened_bodies.pop(str(at(offset)))
+        assert reopened_bodies == before
+        tools["program_close"](reopened)
+    finally:
+        workspace.close_all()

@@ -108,7 +108,19 @@ MCP 客户端应自行拉起 stdio 进程。等价通用配置如下：
 
 公开 URL 不能包含 wildcard host、用户信息、查询参数或路径前缀。敏感值只从环境变量或未跟踪 `.env` 读取；不要把真实 token 写入 TOML、日志、命令历史或 Git。
 
-当 `GHIDRA_MCP_MAX_WORKERS > 1` 时，互不相关的工具调用会在不同的 JVM worker 线程上运行。同一程序上的只读调用（例如 `decompile_function`）可以并发，写入调用则拿独占的按程序闸门，因此 Ghidra 事务与存盘不会重叠。生命周期调用（`program_open`、`program_close`）按底层二进制键控，同一二进制的并发会话仍会串行。调用先等待程序闸门再占用 worker，因此忙碌的程序不会拖住其它程序上的调用；已在等待的写入不会被晚到的读取插队；退出时，服务器会等正在运行的调用结束后再关闭程序。这段排空在 stdin EOF、传输正常返回以及收到 SIGTERM（包括 `docker stop`）时都会执行：stdio 模式下 SIGTERM 会像 stdin 关闭一样停止读取，HTTP 模式下先让 uvicorn 优雅关闭；随后等正在运行的调用结束，由 `close_all` 保存并关闭所有已打开的程序，进程最后以状态码 143 退出。仍在运行的调用的回复不会再送达（MCP 传输已经关闭），但调用本身会完成并存盘。排空没有时间上限，请给 `docker stop -t`（或编排系统的宽限期）留出足够时间，覆盖预期最长的调用（例如自动分析）；宽限期过后的 SIGKILL 仍会打断它。
+当 `GHIDRA_MCP_MAX_WORKERS > 1` 时，互不相关的工具调用会在不同的 JVM worker 线程上运行。同一程序上的只读调用（例如 `decompile_function`）可以并发，写入调用则拿独占的按程序闸门，因此 Ghidra 事务与存盘不会重叠。生命周期调用（`program_open`、`program_close`）按底层二进制键控，同一二进制的并发会话仍会串行。调用先等待程序闸门再占用 worker，因此忙碌的程序不会拖住其它程序上的调用；已在等待的写入不会被晚到的读取插队；退出时，服务器会等正在运行的调用结束后再关闭程序（见[关闭](#关闭)）。
+
+## 关闭
+
+本节适用于任何 `GHIDRA_MCP_MAX_WORKERS` 设置，包括默认值 1。服务器在 stdin EOF、传输正常返回以及收到 SIGTERM（包括 `docker stop`）时关闭。stdio 模式下 SIGTERM 会像 stdin 关闭一样停止读取，HTTP 模式下先让 uvicorn 优雅关闭。随后服务器等正在运行的工具调用结束，再执行 `close_all`，尝试保存并关闭所有已打开的程序。stdin EOF 后进程以状态码 0 退出，SIGTERM 后以状态码 143 退出。仍在运行的调用的回复不会再送达（MCP 传输已经关闭），但这些调用会在 `close_all` 之前运行完毕。排空期间再次收到的 SIGTERM 只记日志，然后被忽略。
+
+排空没有时间上限，请给 `docker stop -t`（或编排系统的宽限期）留出足够时间，覆盖预期最长的调用（例如自动分析）。宽限期过后的 SIGKILL 会打断排空，届时尚未存盘的工作会丢失。
+
+关闭时的存盘是尽力而为，不是保证：
+
+- 如果关闭时 `close_all` 抛出异常（例如某个程序无法存盘），服务器会记录 traceback，进程以状态码 1 退出，而不是 0 或 143。`close_all` 仍会尝试其余所有已打开的程序，但失败的程序不会存盘。
+- JVM 启动后大约最初一到两秒内，SIGTERM 仍由 JVM 自己处理：进程立即以状态码 143 退出，不排空，也不执行 `close_all`。JVM 在第一次 `program_open` 时启动，因此这段时间内还没有已打开的程序。
+- SIGINT 和 SIGHUP 不走这套关闭流程。JVM 启动后由 JVM 处理它们，进程以状态码 130（SIGINT）或 129（SIGHUP）退出，不执行 `close_all`。请用 SIGTERM 或关闭 stdin 来停止服务器。
 
 ## 文档
 

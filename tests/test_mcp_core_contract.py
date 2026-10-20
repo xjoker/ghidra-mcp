@@ -458,6 +458,10 @@ def test_runtime_rejects_ghidra_versions_with_known_reachable_vulnerabilities(
     # 错误文本会经 MCP 工具结果返回客户端，不得包含宿主机路径；路径只进服务端日志。
     assert str(install_dir.resolve()) not in message
     assert str(tmp_path) not in message
+    # Deliberately broad: this message's wording contains no "/" or "\\" at all, so any
+    # separator means a path slipped back in. If the wording ever needs one (a URL, a
+    # version range), switch to the absolute-path regex used in
+    # tests/test_client_error_paths_contract.py instead of dropping the check.
     assert "/" not in message and "\\" not in message
     server_logs = [
         record.getMessage() for record in caplog.records if record.name == "ghidra_mcp.runtime"

@@ -44,7 +44,11 @@ def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
     try:
         lines = properties.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
-        raise WorkspaceError(f"无法确认 Ghidra 版本：未能读取 {properties}") from error
+        # Host paths go to the server log only; the client-facing text stays path-free.
+        _LOGGER.error("无法确认 Ghidra 版本：未能读取 %s：%s", properties, error)
+        raise WorkspaceError(
+            "无法确认 Ghidra 版本：未能读取安装目录中的 application.properties"
+        ) from error
     for line in lines:
         key, separator, value = line.partition("=")
         if separator and key.strip() == "application.version":
@@ -53,7 +57,10 @@ def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
                 major, minor, patch = match.groups()
                 return int(major), int(minor), int(patch or 0)
             break
-    raise WorkspaceError(f"无法确认 Ghidra 版本：{properties} 缺少有效的 application.version")
+    _LOGGER.error("无法确认 Ghidra 版本：%s 缺少有效的 application.version", properties)
+    raise WorkspaceError(
+        "无法确认 Ghidra 版本：安装目录中的 application.properties 缺少有效的 application.version"
+    )
 
 
 def _detach_current_thread_from_jvm() -> None:
@@ -175,7 +182,10 @@ class GhidraRuntime:
         with self._lock:
             if self._launcher is None:
                 if not self.install_dir.is_dir():
-                    raise WorkspaceError(f"Ghidra 安装目录不存在：{self.install_dir}")
+                    _LOGGER.error("Ghidra 安装目录不存在：%s", self.install_dir)
+                    raise WorkspaceError(
+                        "Ghidra 安装目录不存在：请将 GHIDRA_INSTALL_DIR 指向有效的 Ghidra 安装目录"
+                    )
                 version = _read_ghidra_version(self.install_dir)
                 if version < _MINIMUM_GHIDRA_VERSION:
                     detected = _format_version(version)
@@ -371,10 +381,14 @@ class ProgramWorkspace:
         analyze: bool = True,
     ) -> str:
         binary = binary_path.resolve()
+        # The resolved path and the input root are host paths: log them, and echo back only
+        # the path exactly as the client supplied it.
         if self.input_root is not None and not binary.is_relative_to(self.input_root):
-            raise WorkspaceError(f"输入路径超出允许的输入根目录：{self.input_root}")
+            _LOGGER.warning("输入路径 %s 超出允许的输入根目录 %s", binary, self.input_root)
+            raise WorkspaceError("输入路径超出允许的输入根目录（GHIDRA_MCP_INPUT_ROOT）")
         if not binary.is_file():
-            raise WorkspaceError(f"输入二进制不存在：{binary}")
+            _LOGGER.warning("输入二进制不存在：%s", binary)
+            raise WorkspaceError(f"输入二进制不存在：{binary_path}")
         project_name = _persistent_project_name(binary)
         self.runtime.ensure_started()
         effective_location = (
@@ -406,10 +420,15 @@ class ProgramWorkspace:
                 raise WorkspaceError(f"程序会话不存在：{program_id}") from error
 
     def resource_key(self, program_id: str) -> str:
-        """返回会话底层程序的稳定资源键，使同一程序的不同会话写入互斥。
+        """Return a stable resource key for the session's program so that writes from
+        different sessions of the same program are mutually exclusive.
 
-        在事件循环线程上调用，因此不取 self._lock：close() 持锁期间会存盘，
-        取锁会让传输层卡住。单次 dict 读取在 GIL 下是原子的。
+        This may be called from the event loop thread or from a pool thread (the server
+        resolves resource keys through ``asyncio.to_thread``). It still does not take
+        ``self._lock``: ``close()`` saves while holding that lock, so waiting on it here
+        would stall the caller. Lock-free reading is safe because a single ``dict.get`` is
+        atomic under the CPython GIL, and ``record.path`` never changes while the record
+        is alive.
         """
 
         record = self._programs.get(program_id)

@@ -5,7 +5,12 @@ from typing import Any
 from ..registry import ToolDefinition, ToolRegistry
 from ..runtime import ProgramWorkspace
 from ..transaction import program_transaction
+from .listing import _new_pseudo_disassembler
 from .navigation import ToolInputError
+
+# Upper bound on instructions followed when predicting a new function's body. A body this large
+# is almost certainly a wrong entry; function_create rejects instead of guessing.
+_MAX_PREDICTED_INSTRUCTIONS = 20_000
 
 
 def _user_defined_source() -> Any:
@@ -53,6 +58,70 @@ def _computed_function_body(program: Any, entry: Any) -> Any:
     from ghidra.util.task import TaskMonitor
 
     return CreateFunctionCmd.getFunctionBody(program, entry, False, TaskMonitor.DUMMY)
+
+
+def _new_address_set() -> Any:
+    from ghidra.program.model.address import AddressSet
+
+    return AddressSet()
+
+
+def _predicted_function_body(program: Any, entry: Any, address: str) -> Any:
+    """Predict, without writing to the program, the body a new function at ``entry`` gets later.
+
+    ``_computed_function_body`` only follows instructions that are already disassembled. When the
+    entry (or code it flows to) is not disassembled yet, Ghidra creates a one-byte function, and
+    the next auto-analysis disassembles from the entry and grows the body, carving any overlap
+    out of the neighbouring functions. This walks the same flow ahead of time: it uses the
+    listing's instruction where one exists and PseudoDisassembler (read only) elsewhere, follows
+    fall-through and non-call flows, and stops at other functions' entries, at defined data and
+    at bytes that do not decode, like disassembly and CreateFunctionCmd do. ``address`` is the
+    client's argument, used only in error messages.
+    """
+    listing = program.getListing()
+    functions = program.getFunctionManager()
+    pseudo = None
+    body = _new_address_set()
+    pending = [entry]
+    seen: set[str] = set()
+    followed = 0
+    while pending:
+        current = pending.pop()
+        key = str(current)
+        if key in seen or not current.isMemoryAddress():
+            continue
+        seen.add(key)
+        is_entry = key == str(entry)
+        if not is_entry and functions.getFunctionAt(current) is not None:
+            continue
+        instruction = listing.getInstructionAt(current)
+        if instruction is None:
+            if (
+                listing.getInstructionContaining(current) is not None
+                or listing.getDefinedDataContaining(current) is not None
+            ):
+                instruction = None
+            else:
+                if pseudo is None:
+                    pseudo = _new_pseudo_disassembler(program)
+                try:
+                    instruction = pseudo.disassemble(current)
+                except Exception:
+                    instruction = None
+            if instruction is None:
+                if is_entry:
+                    raise ToolInputError(f"入口处的字节无法解码为指令：{address}")
+                continue
+        followed += 1
+        if followed > _MAX_PREDICTED_INSTRUCTIONS:
+            raise ToolInputError(f"从入口推算的函数体超过指令数上限，拒绝创建：{address}")
+        body.addRange(instruction.getMinAddress(), instruction.getMaxAddress())
+        fall_through = instruction.getFallThrough()
+        if fall_through is not None:
+            pending.append(fall_through)
+        if not instruction.getFlowType().isCall():
+            pending.extend(instruction.getFlows() or ())
+    return body
 
 
 def _first_overlapping_function(program: Any, body: Any) -> Any:
@@ -135,18 +204,28 @@ def register_write_tools(registry: ToolRegistry, workspace: ProgramWorkspace) ->
         # deleting the new function later leaves that range unassigned (issue #4).
         containing = api.getFunctionContaining(resolved)
         if containing is not None:
-            function_name, entry_point = _function_identity(containing)
+            existing_function_name, entry_point = _function_identity(containing)
             raise ToolInputError(
-                f"地址位于已有函数 {function_name}（入口 {entry_point}）的函数体内：{address}"
+                f"地址位于已有函数 {existing_function_name}（入口 {entry_point}）"
+                f"的函数体内：{address}"
             )
         program = api.getCurrentProgram()
-        overlapping = _first_overlapping_function(
-            program, _computed_function_body(program, resolved)
-        )
+        # Reject any intersection, also where CreateFunctionCmd would only trim the overlap from
+        # the new function and leave the existing one alone (for example a jmp into the middle
+        # of a later function): rejecting is the one behaviour that never changes another
+        # function, now or when analysis later grows the new one. Only the first overlapping
+        # function is reported.
+        would_be_body = _computed_function_body(program, resolved)
+        if resolved.isMemoryAddress():
+            would_be_body = would_be_body.union(
+                _predicted_function_body(program, resolved, address)
+            )
+        overlapping = _first_overlapping_function(program, would_be_body)
         if overlapping is not None:
-            function_name, entry_point = _function_identity(overlapping)
+            existing_function_name, entry_point = _function_identity(overlapping)
             raise ToolInputError(
-                f"新函数体将与已有函数 {function_name}（入口 {entry_point}）重叠：{address}"
+                f"新函数体将与已有函数 {existing_function_name}（入口 {entry_point}）"
+                f"重叠：{address}"
             )
         new_name = _name(name)
         with program_transaction(
@@ -233,7 +312,7 @@ def register_write_tools(registry: ToolRegistry, workspace: ProgramWorkspace) ->
             "function_create",
             """在尚无函数的入口地址创建命名函数。
 
-输入输出与副作用：输入程序会话、入口地址和名称；返回新函数名称与入口；事务失败自动回滚。入口位于已有函数体内，或 Ghidra 从入口推算的函数体会与已有函数重叠时拒绝且不修改任何函数。
+输入输出与副作用：输入程序会话、入口地址和名称；返回新函数名称与入口；事务失败自动回滚。入口位于已有函数体内时拒绝。从入口推算的函数体（沿已反汇编指令，以及对尚未反汇编的字节做只读伪反汇编，即后续分析会长出的函数体；不跟随调用，止于其他函数入口）与任何已有函数有交集时也拒绝，错误只列出第一个重叠的函数；其中包括 Ghidra 本可只从新函数中减去重叠部分而不改动已有函数的情形（例如 jmp 跳入后方函数中部），这样无论创建时还是之后的 analysis_run 都不会改动其他函数。入口字节无法解码为指令时拒绝。被拒绝时不修改任何函数。
 
 何时使用：分析遗漏但已确认代码入口时调用；入口已有函数时改用 function_rename；要把地址并入已有函数时改用 function_body_add。
 """,

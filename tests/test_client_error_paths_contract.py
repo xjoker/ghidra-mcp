@@ -954,7 +954,10 @@ AUDITED_INTERPOLATIONS = {
     "address": "Ghidra address or the client's address argument",
     "next_address": "Ghidra address",
     "entry_point": "Ghidra address",
-    "function_name": "name of a function in the program, which functions_list already returns",
+    "existing_function_name": (
+        "Function.getName() of an existing function, bound only from _function_identity in"
+        " tools/writes.py; functions_list already returns it"
+    ),
     "value": "the client's argument value",
     "path": "the client's data type path argument",
     "program_id": "the client's program_id argument",

@@ -1,5 +1,7 @@
 import asyncio
-from dataclasses import dataclass
+import sys
+import types
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -11,6 +13,72 @@ class FakeAddress(str):
     def compareTo(self, other: object) -> int:
         return (self > str(other)) - (self < str(other))
 
+    def isMemoryAddress(self) -> bool:
+        return True
+
+
+@dataclass
+class FakeFlowType:
+    call: bool = False
+
+    def isCall(self) -> bool:
+        return self.call
+
+
+@dataclass
+class FakeInstruction:
+    """Listing or pseudo-disassembled instruction; addresses are fixed-width hex strings."""
+
+    start: str
+    end: str
+    fall_through: str | None = None
+    flows: tuple[str, ...] = ()
+    call: bool = False
+
+    def getMinAddress(self) -> FakeAddress:
+        return FakeAddress(self.start)
+
+    def getMaxAddress(self) -> FakeAddress:
+        return FakeAddress(self.end)
+
+    def getFallThrough(self) -> FakeAddress | None:
+        return None if self.fall_through is None else FakeAddress(self.fall_through)
+
+    def getFlows(self) -> list[FakeAddress]:
+        return [FakeAddress(flow) for flow in self.flows]
+
+    def getFlowType(self) -> FakeFlowType:
+        return FakeFlowType(self.call)
+
+
+class FakePseudoDisassembler:
+    """Decodes every address as a one-byte terminal instruction unless the program says else."""
+
+    def __init__(self, program: "FakeProgram") -> None:
+        self.program = program
+
+    def disassemble(self, address: str) -> FakeInstruction:
+        self.program.pseudo_requests.append(str(address))
+        if address in self.program.undecodable:
+            raise RuntimeError("UnknownInstructionException")
+        return self.program.pseudo.get(address, FakeInstruction(address, address))
+
+
+@dataclass
+class FakeCreateFunctionCmd:
+    """Stands in for ghidra.app.cmd.function.CreateFunctionCmd and records its arguments."""
+
+    calls: list[tuple[object, ...]] = field(default_factory=list)
+
+    def getFunctionBody(
+        self, program: "FakeProgram", entry: str, include_other_functions: object, monitor: object
+    ) -> "FakeBody":
+        self.calls.append((program, entry, include_other_functions, monitor))
+        return program.computed_body(entry)
+
+
+DUMMY_MONITOR = object()
+
 
 class FakeProgram:
     def __init__(self) -> None:
@@ -19,9 +87,13 @@ class FakeProgram:
         self.symbol_table = FakeSymbolTable(self)
         self.undo_name: str | None = None
         self.function_manager: FakeFunctionManager | None = None
-        # Bodies that Ghidra would compute for a new function at an entry; default is one byte.
+        # Bodies that CreateFunctionCmd.getFunctionBody would compute; default is one byte.
         self.computed_bodies: dict[str, FakeBody] = {}
         self.computed_body_requests: list[str] = []
+        # Pseudo-disassembly of not yet disassembled bytes (see FakePseudoDisassembler).
+        self.pseudo: dict[str, FakeInstruction] = {}
+        self.undecodable: set[str] = set()
+        self.pseudo_requests: list[str] = []
 
     def startTransaction(self, description: str) -> int:
         self.events.append(("start", description))
@@ -107,6 +179,9 @@ class FakeBody:
     def union(self, other: "FakeBody") -> "FakeBody":
         return FakeBody([*self.ranges, *other.ranges])
 
+    def addRange(self, start: str, end: str) -> None:
+        self.ranges.append((str(start), str(end)))
+
     def intersects(self, other: "FakeBody") -> bool:
         return any(
             start <= other_end and other_start <= end
@@ -131,6 +206,9 @@ class FakeIterator:
 class FakeFunctionManager:
     def __init__(self, api: "FakeAPI") -> None:
         self.api = api
+
+    def getFunctionAt(self, address: str) -> "FakeFunction | None":
+        return self.api.getFunctionAt(address)
 
     def getFunctionsOverlapping(self, body: FakeBody) -> FakeIterator:
         functions = [self.api.function] if self.api.function is not None else []
@@ -166,6 +244,20 @@ class FakeSymbolTable:
 class FakeListing:
     def __init__(self, program: FakeProgram) -> None:
         self.program = program
+        self.instructions: dict[str, FakeInstruction] = {}
+        self.defined_data: set[str] = set()
+
+    def getInstructionAt(self, address: str) -> FakeInstruction | None:
+        return self.instructions.get(address)
+
+    def getInstructionContaining(self, address: str) -> FakeInstruction | None:
+        return next(
+            (item for item in self.instructions.values() if item.start <= address <= item.end),
+            None,
+        )
+
+    def getDefinedDataContaining(self, address: str) -> str | None:
+        return address if address in self.defined_data else None
 
     def setComment(self, address: str, kind: object, text: str | None) -> None:
         self.program.events.append(("comment", address, kind, text))
@@ -218,15 +310,36 @@ class FakeWorkspace:
             raise RuntimeError("disk unavailable")
 
 
+def _install_fake_ghidra(monkeypatch: pytest.MonkeyPatch) -> FakeCreateFunctionCmd:
+    """Fake only the Ghidra modules, so the real _computed_function_body and the real
+    _predicted_function_body run against the fakes and their arguments are observable."""
+    from ghidra_mcp.tools import writes
+
+    command = FakeCreateFunctionCmd()
+    modules = {
+        name: types.ModuleType(name)
+        for name in ("ghidra", "ghidra.app", "ghidra.app.cmd", "ghidra.util")
+    }
+    modules["ghidra.app.cmd.function"] = types.ModuleType("ghidra.app.cmd.function")
+    modules["ghidra.app.cmd.function"].CreateFunctionCmd = command  # type: ignore[attr-defined]
+    modules["ghidra.util.task"] = types.ModuleType("ghidra.util.task")
+    modules["ghidra.util.task"].TaskMonitor = types.SimpleNamespace(  # type: ignore[attr-defined]
+        DUMMY=DUMMY_MONITOR
+    )
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(writes, "_user_defined_source", lambda: "USER_DEFINED")
+    monkeypatch.setattr(writes, "_new_address_set", lambda: FakeBody([]))
+    monkeypatch.setattr(writes, "_new_pseudo_disassembler", FakePseudoDisassembler)
+    return command
+
+
 def _tools(workspace: FakeWorkspace, monkeypatch: pytest.MonkeyPatch):
     from ghidra_mcp.tools import writes
 
-    monkeypatch.setattr(writes, "_user_defined_source", lambda: "USER_DEFINED")
+    workspace.api.program.create_function_cmd = _install_fake_ghidra(monkeypatch)
     monkeypatch.setattr(writes, "_comment_type", lambda value: value.upper())
     monkeypatch.setattr(writes, "_address_set", lambda start, end: FakeBody([(start, end)]))
-    monkeypatch.setattr(
-        writes, "_computed_function_body", lambda program, entry: program.computed_body(entry)
-    )
     registry = ToolRegistry()
     writes.register_write_tools(registry, workspace)
     return {tool.name: tool.handler for tool in registry.enabled_tools()}
@@ -413,10 +526,7 @@ def test_function_create_containment_errors_reach_mcp_clients(
 
     workspace = FakeWorkspace()
     workspace.api.program.computed_bodies["00400008"] = FakeBody([("00400008", "00400013")])
-    monkeypatch.setattr(writes, "_user_defined_source", lambda: "USER_DEFINED")
-    monkeypatch.setattr(
-        writes, "_computed_function_body", lambda program, entry: program.computed_body(entry)
-    )
+    _install_fake_ghidra(monkeypatch)
     registry = ToolRegistry()
     writes.register_write_tools(registry, workspace)
     executor = GhidraToolExecutor()
@@ -448,3 +558,155 @@ def test_function_create_containment_errors_reach_mcp_clients(
     assert free.structuredContent == {"name": "probe", "entry_point": "00400030"}
     assert _created(workspace) == [("create", "00400030", "probe")]
     assert workspace.saved == ["program-1"]
+
+
+def test_function_create_computes_the_body_exactly_like_create_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FlatProgramAPI.createFunction -> CreateFunctionCmd(name, entry, null, ...) computes the body
+    # with getFunctionBody(program, entry, false, monitor): flow must stop at other functions.
+    workspace = FakeWorkspace()
+    tools = _tools(workspace, monkeypatch)
+
+    tools["function_create"]("program-1", "00400030", "created")
+
+    (call,) = workspace.api.program.create_function_cmd.calls
+    program, entry, include_other_functions, monitor = call
+    assert program is workspace.api.program
+    assert entry == "00400030"
+    assert include_other_functions is False
+    assert monitor is DUMMY_MONITOR
+
+
+@pytest.mark.parametrize(
+    ("pseudo", "listing"),
+    [
+        ({"00400008": FakeInstruction("00400008", "0040000b", flows=("00400014",))}, True),
+        (
+            {
+                "00400008": FakeInstruction("00400008", "0040000b", fall_through="0040000c"),
+                "0040000c": FakeInstruction("0040000c", "0040000e", fall_through="00400011"),
+            },
+            False,
+        ),
+    ],
+    ids=["jmp-into-disassembled-body", "falls-into-undisassembled-body"],
+)
+def test_function_create_rejects_an_undisassembled_entry_whose_flow_reaches_a_function(
+    monkeypatch: pytest.MonkeyPatch, pseudo: dict[str, FakeInstruction], listing: bool
+) -> None:
+    # Issue #4 review M1: the entry is not disassembled, so getFunctionBody sees one byte, but
+    # the next analysis_run would grow the function into FUN_00400010 and carve it.
+    workspace = FakeWorkspace()
+    workspace.api.program.pseudo.update(pseudo)
+    if listing:
+        workspace.api.program.listing.instructions["00400014"] = FakeInstruction(
+            "00400014", "00400017", fall_through="00400018"
+        )
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError) as raised:
+        tools["function_create"]("program-1", "00400008", "missed_entry")
+
+    assert str(raised.value) == "新函数体将与已有函数 FUN_00400010（入口 00400010）重叠：00400008"
+    assert workspace.api.program.pseudo_requests[0] == "00400008"
+    assert workspace.api.program.events == []
+    assert workspace.saved == []
+
+
+@pytest.mark.parametrize(
+    ("pseudo", "data", "undecodable", "not_decoded"),
+    [
+        (
+            {"00400008": FakeInstruction("00400008", "0040000f", fall_through="00400010")},
+            (),
+            (),
+            "00400010",
+        ),
+        (
+            {
+                "00400000": FakeInstruction(
+                    "00400000", "00400004", fall_through="00400005", flows=("00400014",), call=True
+                )
+            },
+            (),
+            (),
+            "00400014",
+        ),
+        (
+            {"00400000": FakeInstruction("00400000", "00400003", fall_through="00400004")},
+            ("00400004",),
+            (),
+            "00400004",
+        ),
+        (
+            {"00400000": FakeInstruction("00400000", "00400003", fall_through="00400004")},
+            (),
+            ("00400004",),
+            None,
+        ),
+    ],
+    ids=["stops-at-function-entry", "does-not-follow-calls", "stops-at-data", "stops-at-bad-bytes"],
+)
+def test_function_create_allows_an_undisassembled_entry_whose_flow_stays_clear(
+    monkeypatch: pytest.MonkeyPatch,
+    pseudo: dict[str, FakeInstruction],
+    data: tuple[str, ...],
+    undecodable: tuple[str, ...],
+    not_decoded: str | None,
+) -> None:
+    workspace = FakeWorkspace()
+    workspace.api.program.pseudo.update(pseudo)
+    workspace.api.program.listing.defined_data.update(data)
+    workspace.api.program.undecodable.update(undecodable)
+    entry = next(iter(pseudo))
+    tools = _tools(workspace, monkeypatch)
+
+    assert tools["function_create"]("program-1", entry, "clear")["entry_point"] == entry
+    assert _created(workspace) == [("create", entry, "clear")]
+    if not_decoded is not None:
+        assert not_decoded not in workspace.api.program.pseudo_requests
+
+
+@pytest.mark.parametrize("blocker", ["undecodable", "data", "inside-instruction"])
+def test_function_create_rejects_an_entry_that_is_not_decodable_code(
+    monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    workspace = FakeWorkspace()
+    program = workspace.api.program
+    if blocker == "undecodable":
+        program.undecodable.add("00400031")
+    elif blocker == "data":
+        program.listing.defined_data.add("00400031")
+    else:
+        program.listing.instructions["00400030"] = FakeInstruction("00400030", "00400033")
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError, match="^入口处的字节无法解码为指令：00400031$"):
+        tools["function_create"]("program-1", "00400031", "not_code")
+
+    assert program.events == []
+    assert program.pseudo_requests == (["00400031"] if blocker == "undecodable" else [])
+
+
+def test_function_create_rejects_a_predicted_body_over_the_instruction_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ghidra_mcp.tools import writes
+
+    workspace = FakeWorkspace()
+    workspace.api.program.pseudo.update(
+        {
+            "00400030": FakeInstruction("00400030", "00400030", fall_through="00400031"),
+            "00400031": FakeInstruction("00400031", "00400031", fall_through="00400032"),
+        }
+    )
+    tools = _tools(workspace, monkeypatch)
+    monkeypatch.setattr(writes, "_MAX_PREDICTED_INSTRUCTIONS", 2)
+
+    with pytest.raises(
+        ToolInputError, match="^从入口推算的函数体超过指令数上限，拒绝创建：00400030$"
+    ):
+        tools["function_create"]("program-1", "00400030", "huge")
+
+    assert workspace.api.program.events == []

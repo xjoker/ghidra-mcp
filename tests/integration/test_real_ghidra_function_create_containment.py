@@ -134,3 +134,93 @@ def test_real_function_create_refuses_to_split_or_overlap_existing_functions(
         tools["program_close"](reopened)
     finally:
         workspace.close_all()
+
+
+def _all_bodies(workspace: ProgramWorkspace, program_id: str) -> dict[str, list[tuple[str, str]]]:
+    manager = workspace.get(program_id).getCurrentProgram().getFunctionManager()
+    bodies = {}
+    functions = manager.getFunctions(True)
+    while functions.hasNext():
+        function = functions.next()
+        bodies[str(function.getEntryPoint())] = [
+            (str(item.getMinAddress()), str(item.getMaxAddress()))
+            for item in function.getBody().getAddressRanges()
+        ]
+    return bodies
+
+
+@pytest.mark.integration
+def test_real_function_create_on_undisassembled_bytes_cannot_carve_a_function_later(
+    tmp_path: Path,
+) -> None:
+    # Review M1: on bytes that are not disassembled yet, getFunctionBody sees a one-byte body;
+    # the next analysis_run then grows the new function and carves its neighbour.
+    install_value = os.environ.get("GHIDRA_INSTALL_DIR")
+    if not install_value:
+        pytest.skip("GHIDRA_INSTALL_DIR 未配置")
+    if not FIXTURE.is_file():
+        pytest.skip("先运行 scripts/build_fixtures.py")
+
+    workspace = ProgramWorkspace(
+        GhidraRuntime(Path(install_value)), project_location=tmp_path / "projects"
+    )
+    tools = {tool.name: tool.handler for tool in build_default_registry(workspace).enabled_tools()}
+    try:
+        program_id = tools["program_open"](str(FIXTURE), analyze=True)["program_id"]
+        functions = tools["functions_list"](program_id, offset=0, limit=1000)
+        mix = next(item for item in functions if item["name"] == "mix")["entry_point"]
+        gap = _instructions(workspace, program_id, mix)[3]
+        gap_address = str(gap.getAddress())
+        api = workspace.get(program_id)
+        program = api.getCurrentProgram()
+        from ghidra.program.model.address import AddressSet
+
+        mix_function = api.getFunctionAt(api.toAddr(mix))
+        carved = AddressSet(mix_function.getBody())
+        carved.delete(gap.getMinAddress(), gap.getMaxAddress())
+        transaction = program.startTransaction("test setup: code that analysis missed")
+        mix_function.setBody(carved)
+        api.clearListing(gap.getMinAddress(), gap.getMaxAddress())
+        program.endTransaction(transaction, True)
+        workspace.save(program_id)
+        assert api.getInstructionAt(gap.getMinAddress()) is None
+        before = _all_bodies(workspace, program_id)
+
+        # 1. The would-be body is predicted by pseudo-disassembly, so the create is rejected.
+        with pytest.raises(ToolInputError) as overlap:
+            tools["function_create"](program_id, gap_address, "missed_entry")
+        assert str(overlap.value) == f"新函数体将与已有函数 mix（入口 {mix}）重叠：{gap_address}"
+        assert api.getInstructionAt(gap.getMinAddress()) is None, "the check must not disassemble"
+        assert _all_bodies(workspace, program_id) == before
+
+        # 2. ... and analysis afterwards does not change any function either, also after reopen.
+        tools["analysis_run"](program_id)
+        assert _all_bodies(workspace, program_id) == before
+        tools["program_close"](program_id)
+        reopened = tools["program_open"](str(FIXTURE), analyze=False)["program_id"]
+        assert _all_bodies(workspace, reopened) == before
+        assert _containing(workspace, reopened, gap_address) is None
+
+        # 3. A whole function that analysis "missed" (deleted and its code cleared) can still be
+        #    created on undisassembled bytes; analysis grows it without touching the others.
+        target = next(item for item in functions if item["name"] == "fixture_symbolic")
+        entry = target["entry_point"]
+        api = workspace.get(reopened)
+        program = api.getCurrentProgram()
+        original = api.getFunctionAt(api.toAddr(entry)).getBody()
+        others = {key: value for key, value in _all_bodies(workspace, reopened).items()}
+        others.pop(entry)
+        transaction = program.startTransaction("test setup: a function analysis missed")
+        api.removeFunction(api.getFunctionAt(api.toAddr(entry)))
+        api.clearListing(original)
+        program.endTransaction(transaction, True)
+        workspace.save(reopened)
+        assert api.getInstructionAt(api.toAddr(entry)) is None
+        assert tools["function_create"](reopened, entry, "issue4_missed")["entry_point"] == entry
+        tools["analysis_run"](reopened)
+        after = _all_bodies(workspace, reopened)
+        assert after.pop(entry)[0][0] == entry
+        assert after == others
+        tools["program_close"](reopened)
+    finally:
+        workspace.close_all()

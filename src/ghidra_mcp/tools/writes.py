@@ -43,6 +43,28 @@ def _address(api: Any, value: str) -> Any:
     return address
 
 
+def _computed_function_body(program: Any, entry: Any) -> Any:
+    """Return the body that ``createFunction(entry, name)`` would compute for a new function.
+
+    FlatProgramAPI.createFunction runs ``CreateFunctionCmd`` with no body, which computes the body
+    with this exact call (follow flow from the entry, excluding calls and other functions' entries).
+    """
+    from ghidra.app.cmd.function import CreateFunctionCmd
+    from ghidra.util.task import TaskMonitor
+
+    return CreateFunctionCmd.getFunctionBody(program, entry, False, TaskMonitor.DUMMY)
+
+
+def _first_overlapping_function(program: Any, body: Any) -> Any:
+    functions = program.getFunctionManager().getFunctionsOverlapping(body)
+    return functions.next() if functions.hasNext() else None
+
+
+def _function_identity(function: Any) -> tuple[str, str]:
+    """Name and entry point of an existing function, for client-facing errors (program data)."""
+    return str(function.getName()), str(function.getEntryPoint())
+
+
 def _name(value: str) -> str:
     name = value.strip()
     if not name:
@@ -108,7 +130,24 @@ def register_write_tools(registry: ToolRegistry, workspace: ProgramWorkspace) ->
         resolved = _address(api, address)
         if api.getFunctionAt(resolved) is not None:
             raise ToolInputError(f"地址已有函数：{address}")
+        # CreateFunctionCmd does not refuse an entry inside another function, or a computed body
+        # that runs into one: it silently carves the overlap out of the existing function, and
+        # deleting the new function later leaves that range unassigned (issue #4).
+        containing = api.getFunctionContaining(resolved)
+        if containing is not None:
+            function_name, entry_point = _function_identity(containing)
+            raise ToolInputError(
+                f"地址位于已有函数 {function_name}（入口 {entry_point}）的函数体内：{address}"
+            )
         program = api.getCurrentProgram()
+        overlapping = _first_overlapping_function(
+            program, _computed_function_body(program, resolved)
+        )
+        if overlapping is not None:
+            function_name, entry_point = _function_identity(overlapping)
+            raise ToolInputError(
+                f"新函数体将与已有函数 {function_name}（入口 {entry_point}）重叠：{address}"
+            )
         new_name = _name(name)
         with program_transaction(
             program, "Create function", persist=lambda: workspace.save(program_id)
@@ -194,9 +233,9 @@ def register_write_tools(registry: ToolRegistry, workspace: ProgramWorkspace) ->
             "function_create",
             """在尚无函数的入口地址创建命名函数。
 
-输入输出与副作用：输入程序会话、入口地址和名称；返回新函数名称与入口；事务失败自动回滚。
+输入输出与副作用：输入程序会话、入口地址和名称；返回新函数名称与入口；事务失败自动回滚。入口位于已有函数体内，或 Ghidra 从入口推算的函数体会与已有函数重叠时拒绝且不修改任何函数。
 
-何时使用：分析遗漏但已确认代码入口时调用；入口已有函数时改用 function_rename。
+何时使用：分析遗漏但已确认代码入口时调用；入口已有函数时改用 function_rename；要把地址并入已有函数时改用 function_body_add。
 """,
             function_create,
         ),

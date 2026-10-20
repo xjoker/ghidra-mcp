@@ -1,8 +1,10 @@
+import asyncio
 from dataclasses import dataclass
 
 import pytest
 
 from ghidra_mcp.registry import ToolRegistry
+from ghidra_mcp.tools.navigation import ToolInputError
 
 
 class FakeAddress(str):
@@ -16,6 +18,10 @@ class FakeProgram:
         self.listing = FakeListing(self)
         self.symbol_table = FakeSymbolTable(self)
         self.undo_name: str | None = None
+        self.function_manager: FakeFunctionManager | None = None
+        # Bodies that Ghidra would compute for a new function at an entry; default is one byte.
+        self.computed_bodies: dict[str, FakeBody] = {}
+        self.computed_body_requests: list[str] = []
 
     def startTransaction(self, description: str) -> int:
         self.events.append(("start", description))
@@ -41,6 +47,14 @@ class FakeProgram:
 
     def getSymbolTable(self) -> "FakeSymbolTable":
         return self.symbol_table
+
+    def getFunctionManager(self) -> "FakeFunctionManager":
+        assert self.function_manager is not None
+        return self.function_manager
+
+    def computed_body(self, entry: str) -> "FakeBody":
+        self.computed_body_requests.append(entry)
+        return self.computed_bodies.get(entry, FakeBody([(entry, entry)]))
 
 
 @dataclass
@@ -93,6 +107,37 @@ class FakeBody:
     def union(self, other: "FakeBody") -> "FakeBody":
         return FakeBody([*self.ranges, *other.ranges])
 
+    def intersects(self, other: "FakeBody") -> bool:
+        return any(
+            start <= other_end and other_start <= end
+            for start, end in self.ranges
+            for other_start, other_end in other.ranges
+        )
+
+
+class FakeIterator:
+    """Java-style iterator, as returned by FunctionManager.getFunctionsOverlapping."""
+
+    def __init__(self, items: list[object]) -> None:
+        self.items = list(items)
+
+    def hasNext(self) -> bool:
+        return bool(self.items)
+
+    def next(self) -> object:
+        return self.items.pop(0)
+
+
+class FakeFunctionManager:
+    def __init__(self, api: "FakeAPI") -> None:
+        self.api = api
+
+    def getFunctionsOverlapping(self, body: FakeBody) -> FakeIterator:
+        functions = [self.api.function] if self.api.function is not None else []
+        return FakeIterator(
+            [function for function in functions if function.getBody().intersects(body)]
+        )
+
 
 class FakeSymbol:
     def __init__(self, program: FakeProgram) -> None:
@@ -127,9 +172,11 @@ class FakeListing:
 
 
 class FakeAPI:
-    def __init__(self, *, fail_rename: bool = False) -> None:
+    def __init__(self, *, fail_rename: bool = False, forget_deleted: bool = False) -> None:
         self.program = FakeProgram()
-        self.function = FakeFunction(self.program, fail_rename=fail_rename)
+        self.program.function_manager = FakeFunctionManager(self)
+        self.function: FakeFunction | None = FakeFunction(self.program, fail_rename=fail_rename)
+        self.forget_deleted = forget_deleted
 
     def getCurrentProgram(self) -> FakeProgram:
         return self.program
@@ -138,7 +185,7 @@ class FakeAPI:
         return FakeAddress(address) if address.startswith("0040") else None
 
     def getFunctionContaining(self, address: str) -> FakeFunction | None:
-        return self.function if address in {"00400010", "00400011"} else None
+        return self.function if address in {"00400010", "00400011", "0040001f"} else None
 
     def getFunctionAt(self, address: str) -> FakeFunction | None:
         return self.function if address == "00400010" else None
@@ -149,11 +196,15 @@ class FakeAPI:
 
     def removeFunction(self, function: FakeFunction) -> None:
         self.program.events.append(("delete", function.entry))
+        if self.forget_deleted:
+            self.function = None
 
 
 class FakeWorkspace:
-    def __init__(self, *, fail_rename: bool = False, fail_save: bool = False) -> None:
-        self.api = FakeAPI(fail_rename=fail_rename)
+    def __init__(
+        self, *, fail_rename: bool = False, fail_save: bool = False, forget_deleted: bool = False
+    ) -> None:
+        self.api = FakeAPI(fail_rename=fail_rename, forget_deleted=forget_deleted)
         self.saved: list[str] = []
         self.fail_save = fail_save
 
@@ -173,6 +224,9 @@ def _tools(workspace: FakeWorkspace, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(writes, "_user_defined_source", lambda: "USER_DEFINED")
     monkeypatch.setattr(writes, "_comment_type", lambda value: value.upper())
     monkeypatch.setattr(writes, "_address_set", lambda start, end: FakeBody([(start, end)]))
+    monkeypatch.setattr(
+        writes, "_computed_function_body", lambda program, entry: program.computed_body(entry)
+    )
     registry = ToolRegistry()
     writes.register_write_tools(registry, workspace)
     return {tool.name: tool.handler for tool in registry.enabled_tools()}
@@ -246,4 +300,151 @@ def test_write_tool_rolls_back_when_persistence_fails(monkeypatch: pytest.Monkey
         tools["function_rename"]("program-1", "00400010", "worker")
 
     assert workspace.api.program.events[-1] == ("undo", "Rename function")
+    assert workspace.saved == ["program-1"]
+
+
+def _created(workspace: FakeWorkspace) -> list[tuple[object, ...]]:
+    return [event for event in workspace.api.program.events if event[0] == "create"]
+
+
+@pytest.mark.parametrize("address", ["00400011", "0040001f"])
+def test_function_create_rejects_an_address_inside_an_existing_function_body(
+    monkeypatch: pytest.MonkeyPatch, address: str
+) -> None:
+    workspace = FakeWorkspace()
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError) as raised:
+        tools["function_create"]("program-1", address, "inner")
+
+    message = str(raised.value)
+    assert message == f"地址位于已有函数 FUN_00400010（入口 00400010）的函数体内：{address}"
+    assert "/" not in message
+    assert workspace.api.program.events == []
+    assert workspace.saved == []
+
+
+def test_function_create_still_rejects_an_existing_entry_with_the_old_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = FakeWorkspace()
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError, match="^地址已有函数：00400010$"):
+        tools["function_create"]("program-1", "00400010", "again")
+
+    assert workspace.api.program.events == []
+
+
+def test_function_create_succeeds_at_a_free_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = FakeWorkspace()
+    workspace.api.program.computed_bodies["00400030"] = FakeBody([("00400030", "0040003f")])
+    tools = _tools(workspace, monkeypatch)
+
+    assert tools["function_create"]("program-1", "00400030", "created") == {
+        "name": "created",
+        "entry_point": "00400030",
+    }
+    assert workspace.api.program.computed_body_requests == ["00400030"]
+    assert _created(workspace) == [("create", "00400030", "created")]
+    assert workspace.saved == ["program-1"]
+
+
+def test_function_create_succeeds_when_the_computed_body_ends_just_before_a_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = FakeWorkspace()
+    workspace.api.program.computed_bodies["00400000"] = FakeBody([("00400000", "0040000f")])
+    tools = _tools(workspace, monkeypatch)
+
+    assert tools["function_create"]("program-1", "00400000", "before")["entry_point"] == "00400000"
+    assert _created(workspace) == [("create", "00400000", "before")]
+
+
+def test_function_create_succeeds_at_the_entry_of_a_deleted_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = FakeWorkspace(forget_deleted=True)
+    workspace.api.program.computed_bodies["00400010"] = FakeBody([("00400010", "0040001f")])
+    tools = _tools(workspace, monkeypatch)
+
+    assert tools["function_delete"]("program-1", "00400010") == {"deleted": "00400010"}
+    assert tools["function_create"]("program-1", "00400010", "recreated") == {
+        "name": "recreated",
+        "entry_point": "00400010",
+    }
+    assert _created(workspace) == [("create", "00400010", "recreated")]
+    assert workspace.saved == ["program-1", "program-1"]
+
+
+@pytest.mark.parametrize(
+    "computed",
+    [
+        [("00400008", "00400013")],
+        [("00400008", "0040000b"), ("0040001c", "00400024")],
+        [("00400004", "0040002f")],
+    ],
+    ids=["runs-into-body", "non-contiguous-tail", "covers-whole-function"],
+)
+def test_function_create_rejects_a_computed_body_that_overlaps_an_existing_function(
+    monkeypatch: pytest.MonkeyPatch, computed: list[tuple[str, str]]
+) -> None:
+    workspace = FakeWorkspace()
+    entry = computed[0][0]
+    workspace.api.program.computed_bodies[entry] = FakeBody(computed)
+    tools = _tools(workspace, monkeypatch)
+
+    with pytest.raises(ToolInputError) as raised:
+        tools["function_create"]("program-1", entry, "overlapping")
+
+    assert str(raised.value) == f"新函数体将与已有函数 FUN_00400010（入口 00400010）重叠：{entry}"
+    assert workspace.api.program.computed_body_requests == [entry]
+    assert workspace.api.program.events == []
+    assert workspace.saved == []
+
+
+def test_function_create_containment_errors_reach_mcp_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from ghidra_mcp.server import GhidraToolExecutor, create_mcp_app
+    from ghidra_mcp.tools import writes
+
+    workspace = FakeWorkspace()
+    workspace.api.program.computed_bodies["00400008"] = FakeBody([("00400008", "00400013")])
+    monkeypatch.setattr(writes, "_user_defined_source", lambda: "USER_DEFINED")
+    monkeypatch.setattr(
+        writes, "_computed_function_body", lambda program, entry: program.computed_body(entry)
+    )
+    registry = ToolRegistry()
+    writes.register_write_tools(registry, workspace)
+    executor = GhidraToolExecutor()
+    app = create_mcp_app(registry, host="127.0.0.1", port=8765, tool_executor=executor)
+
+    async def exercise() -> list[object]:
+        async with create_connected_server_and_client_session(app._mcp_server) as client:
+            return [
+                await client.call_tool(
+                    "function_create",
+                    {"program_id": "program-1", "address": address, "name": "probe"},
+                )
+                for address in ("00400011", "00400008", "00400030")
+            ]
+
+    try:
+        inside, overlap, free = asyncio.run(exercise())
+    finally:
+        executor.shutdown()
+
+    def text(result: object) -> str:
+        return "\n".join(getattr(item, "text", "") for item in result.content)  # type: ignore[attr-defined]
+
+    assert inside.isError is True
+    assert "地址位于已有函数 FUN_00400010（入口 00400010）的函数体内：00400011" in text(inside)
+    assert overlap.isError is True
+    assert "新函数体将与已有函数 FUN_00400010（入口 00400010）重叠：00400008" in text(overlap)
+    assert free.isError is False
+    assert free.structuredContent == {"name": "probe", "entry_point": "00400030"}
+    assert _created(workspace) == [("create", "00400030", "probe")]
     assert workspace.saved == ["program-1"]

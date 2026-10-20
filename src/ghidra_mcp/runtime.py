@@ -72,6 +72,27 @@ def _detach_current_thread_from_jvm() -> None:
         jpype.JClass("java.lang.Thread").detach()
 
 
+def ensure_context_class_loader() -> None:
+    """Give the calling thread the system class loader as its Java context class loader.
+
+    Only the thread that creates the JVM gets ``ghidra.GhidraClassLoader`` as its context
+    class loader; threads that JPype attaches later get null. Since the JVM is created on
+    a detached helper thread (see ``GhidraRuntime._start_jvm``), every tool worker is such
+    an attached thread, and Java code that calls ``getContextClassLoader()`` without a null
+    check (ServiceLoader lookups, ``getResource``) would fail on it. Under PyGhidra the
+    system class loader is ``GhidraClassLoader``. Leaves a non-null loader untouched, and is
+    a no-op until a real JVM runs: jpype is only looked up in ``sys.modules`` so this costs
+    nothing before PyGhidra is imported.
+    """
+
+    jpype = sys.modules.get("jpype")
+    if jpype is None or not jpype.isJVMStarted():
+        return
+    thread = jpype.JClass("java.lang.Thread").currentThread()
+    if thread.getContextClassLoader() is None:
+        thread.setContextClassLoader(jpype.JClass("java.lang.ClassLoader").getSystemClassLoader())
+
+
 # Keeps the Java-side SIGTERM handler proxy (and the handler it replaced) alive.
 _JVM_SIGTERM_FORWARDER: list[Any] = []
 
@@ -212,6 +233,12 @@ class GhidraRuntime:
         helper.join()
         if "error" in outcome:
             raise outcome["error"]
+        # The rest of the call that started the JVM runs on this thread with a null
+        # context class loader; restore it before returning (see ensure_context_class_loader).
+        try:
+            ensure_context_class_loader()
+        except Exception:
+            _LOGGER.warning("Could not set the context class loader", exc_info=True)
         return outcome["launcher"]
 
     def analyze(self, program: Any) -> None:

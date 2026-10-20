@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, Response
 
 from .concurrency import ProgramGates, program_resource_key
 from .registry import ToolDefinition, ToolRegistry
-from .runtime import WorkspaceError
+from .runtime import WorkspaceError, ensure_context_class_loader
 from .tools.navigation import ToolInputError
 
 
@@ -76,6 +76,25 @@ def _client_safe_error(tool_name: str, error: Exception) -> Exception | None:
     return _ClientSafeToolError(
         f"{type(error).__name__}：{reason}错误详情包含服务端路径，已对客户端隐去，完整信息见服务端日志"
     )
+
+
+def _on_worker(call: Callable[[], Any]) -> Callable[[], Any]:
+    """Wrap a call so it runs with the system class loader as the worker's context class loader.
+
+    Worker threads are attached to the JVM by JPype with a null context class loader (the
+    JVM is created on a detached helper thread). Checking before every call is cheap and
+    also covers workers that start after the JVM. A failure here is logged and does not
+    fail the tool call.
+    """
+
+    def run() -> Any:
+        try:
+            ensure_context_class_loader()
+        except Exception:
+            _LOGGER.warning("Could not set the worker's context class loader", exc_info=True)
+        return call()
+
+    return run
 
 
 class ExecutorClosedError(RuntimeError):
@@ -138,7 +157,7 @@ class GhidraToolExecutor:
             self._state.wait_for(lambda: self._in_flight == 0)
         try:
             if finalizer is not None:
-                return self._executor.submit(finalizer).result()
+                return self._executor.submit(_on_worker(finalizer)).result()
             return None
         finally:
             self._executor.shutdown(wait=True)
@@ -152,7 +171,7 @@ class GhidraToolExecutor:
                 raise ExecutorClosedError("服务正在关闭，不再接受新的工具调用")
             self._in_flight += 1
         try:
-            future = self._executor.submit(call)
+            future = self._executor.submit(_on_worker(call))
         except BaseException:
             self._finish(None)
             raise

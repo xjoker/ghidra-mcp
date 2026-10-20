@@ -134,3 +134,65 @@ def test_real_jvm_tool_workers_use_the_system_context_class_loader(
         assert probe["loader"] == "ghidra.GhidraClassLoader", json.dumps(probes, indent=1)
         assert probe["is_system"], json.dumps(probes, indent=1)
     assert report["decompiled"]
+
+
+# The JVM starts on the caller's thread while the executor's only worker has run a call
+# before the JVM existed, so the close() finalizer runs on a worker that JPype attaches
+# with a null context class loader. Only the wrapper around the finalizer can fix that.
+_CLOSE_PROBE = r"""
+import json
+import sys
+import threading
+from pathlib import Path
+
+from ghidra_mcp.runtime import GhidraRuntime, ProgramWorkspace
+from ghidra_mcp.server import GhidraToolExecutor
+
+install_dir, fixture, projects = sys.argv[1], sys.argv[2], sys.argv[3]
+workspace = ProgramWorkspace(GhidraRuntime(Path(install_dir)), project_location=Path(projects))
+executor = GhidraToolExecutor(max_workers=1)
+worker = executor.run_sync(lambda: threading.current_thread().name)
+workspace.open(Path(fixture), analyze=False)
+
+
+def finalize():
+    from java.lang import ClassLoader, Thread
+
+    loader = Thread.currentThread().getContextClassLoader()
+    workspace.close_all()
+    return {
+        "thread": threading.current_thread().name,
+        "loader": None if loader is None else str(loader.getClass().getName()),
+        "is_system": loader is not None and bool(loader.equals(ClassLoader.getSystemClassLoader())),
+    }
+
+
+report = {"worker": worker, "finalizer": executor.close(finalize)}
+print("PROBE " + json.dumps(report), flush=True)
+"""
+
+
+@pytest.mark.integration
+def test_real_jvm_close_finalizer_gets_the_system_loader_on_a_fresh_worker(
+    tmp_path: Path,
+) -> None:
+    install_dir = os.environ.get("GHIDRA_INSTALL_DIR")
+    if not install_dir:
+        pytest.skip("GHIDRA_INSTALL_DIR 未配置")
+    if not FIXTURE.is_file():
+        pytest.skip("先运行 scripts/build_fixtures.py")
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CLOSE_PROBE, install_dir, str(FIXTURE), str(tmp_path / "p")],
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE,
+        cwd=tmp_path,
+    )
+    assert completed.returncode == 0, completed.stderr
+    line = next((line for line in completed.stdout.splitlines() if line.startswith("PROBE ")), None)
+    assert line is not None, completed.stdout + completed.stderr
+    report = json.loads(line.removeprefix("PROBE "))
+    assert report["finalizer"]["thread"] == report["worker"], report
+    assert report["finalizer"]["loader"] == "ghidra.GhidraClassLoader", report
+    assert report["finalizer"]["is_system"], report

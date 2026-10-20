@@ -656,6 +656,22 @@ HOST_PATH_ERRORS = {
         "RuntimeError：错误详情包含服务端路径",
         r"\.private",
     ),
+    # PR #25 review M1: non-ASCII segment names are path characters, not escapes.
+    "windows-root-relative-cjk": (
+        RuntimeError(r"无法打开 \数据\项目\private.gpr"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\数据\项目",
+    ),
+    "windows-root-relative-cjk-single-file": (
+        RuntimeError(r"cannot read \工作\项目.txt"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\工作\项目.txt",
+    ),
+    "windows-root-relative-cyrillic": (
+        RuntimeError(r"Не удалось открыть \Документы\файл"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\Документы\файл",
+    ),
     "path-after-punctuation-is-hidden-too": (
         RuntimeError("sizeof(int)/private width mismatch"),
         "RuntimeError：错误详情包含服务端路径",
@@ -1106,6 +1122,19 @@ def _bound_value(module: _Module, target: ast.Name) -> ast.AST | None:
     return None
 
 
+def _helper_reads_host_path(module: _Module, helper: ast.AST, depth: int) -> bool:
+    """Whether any expression in a module-level helper's body reads a host path (review L2).
+
+    The whole body counts, not only its ``return`` values, so `x = os.getcwd(); return x`
+    taints the helper too. Its docstring is left out.
+    """
+
+    body = list(helper.body)  # type: ignore[attr-defined]
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    return any(_reads_host_path(module, statement, depth + 1) for statement in body)
+
+
 def _reads_host_path(module: _Module, value: ast.AST, depth: int = 0) -> bool:
     """Whether ``value`` names a host path source, following module-level helpers it calls."""
 
@@ -1121,42 +1150,97 @@ def _reads_host_path(module: _Module, value: ast.AST, depth: int = 0) -> bool:
     for call in ast.walk(value):
         if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
             helper = helpers.get(call.func.id)
-            for node in ast.walk(helper) if helper is not None else ():
-                if isinstance(node, ast.Return) and node.value is not None:
-                    if _reads_host_path(module, node.value, depth + 1):
-                        return True
+            if helper is not None and _helper_reads_host_path(module, helper, depth):
+                return True
     return False
 
 
+def _opaque_bindings(nodes: list[ast.AST], name: str, scope: ast.AST) -> list[str]:
+    """Bindings of ``name`` that are not a plain `name = value` (review L1, default-deny).
+
+    `except ... as name`, match captures, `import ... as name`, a nested def or class, and a
+    `global` / `nonlocal` declaration all rebind the name without a value the scan can check.
+    """
+
+    found = []
+    for node in nodes:
+        if node is scope:
+            continue
+        if isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append("except ... as")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+            found.append("a match capture")
+        elif isinstance(node, ast.MatchMapping) and node.rest == name:
+            found.append("a match capture")
+        elif isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == name:
+            found.append("an import")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                found.append("a def or class")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            found.append("a global or nonlocal declaration")
+    return found
+
+
 def _provenance_problems(module: _Module, site: ast.Call, name: str) -> list[str]:
-    """Check where an interpolated name comes from: a parameter or a host-path-free binding."""
+    """Check where an interpolated name comes from: a parameter or a host-path-free binding.
+
+    Any binding of the name in the scope that resolves it makes it a local, even when it is
+    also a parameter: a plain assignment, walrus, for / with / comprehension target is checked
+    by value, every other kind of binding fails (see ``_opaque_bindings``). At module level a
+    `global` rewrite from any function in the module fails too.
+    """
 
     scope: ast.AST = site
     while scope in module.parents:
         scope = module.parents[scope]
         if isinstance(scope, _SCOPES) or isinstance(scope, ast.Module):
-            body = scope.body if isinstance(scope, ast.Module) else [scope]
+            if isinstance(scope, ast.Module):
+                statements = [s for s in scope.body if not isinstance(s, _SCOPES)]
+                nodes = [node for statement in statements for node in ast.walk(statement)]
+                nodes += [s for s in scope.body if isinstance(s, _SCOPES)]
+                nodes += [
+                    node
+                    for node in ast.walk(scope)
+                    if isinstance(node, ast.Global) and name in node.names
+                ]
+            else:
+                nodes = list(ast.walk(scope))
             stores = [
                 node
-                for statement in body
-                for node in ast.walk(statement)
+                for node in nodes
                 if isinstance(node, ast.Name)
                 and node.id == name
                 and isinstance(node.ctx, ast.Store)
-                and (not isinstance(scope, ast.Module) or not isinstance(statement, _SCOPES))
             ]
-            problems = []
+            opaque = _opaque_bindings(nodes, name, scope)
+            problems = [
+                f"{{{name}}} is bound by {kind}, which the scan does not follow" for kind in opaque
+            ]
             for store in stores:
                 value = _bound_value(module, store)
                 if value is None:
                     problems.append(f"{{{name}}} is bound in a way the scan does not follow")
                 elif _reads_host_path(module, value):
                     problems.append(f"{{{name}}} is bound to a host path: {ast.unparse(value)}")
-            if stores or (not isinstance(scope, ast.Module) and name in _parameters(scope)):
+            if (
+                stores
+                or opaque
+                or (not isinstance(scope, ast.Module) and name in _parameters(scope))
+            ):
                 return problems
     return [f"{{{name}}} is neither a parameter nor assigned"]
 
 
+# What the scans below do NOT see (review L4, design limits; the runtime sentinel test and
+# code review cover these):
+# - where a parameter's value comes from at the call sites: a parameter named like an audited
+#   value is trusted as the client's argument, so `_fail(os.getcwd())` into `def _fail(path)`
+#   passes, and so does a parameter default (`def f(value=os.getcwd())`);
+# - a lambda that builds the error (`lambda value: ToolInputError(f"{value}")`);
+# - dynamic construction: `type(e)(...)`, `getattr(module, "ToolInputError")`, and changing
+#   `err.args` after the error was built;
+# - helpers in another module, and helper chains deeper than 3 calls.
 def test_pass_through_error_messages_only_interpolate_audited_client_values() -> None:
     sites = _pass_through_sites()
     assert len(sites) >= 50, len(sites)
@@ -1171,7 +1255,8 @@ def test_pass_through_error_messages_only_interpolate_audited_client_values() ->
                 f"{where}: message is not a literal or f-string: {ast.unparse(argument)}"
             )
             continue
-        for part in argument.values:
+        # ast.walk also reaches values nested in a format spec, `{path:{os.getcwd()}}` (L3).
+        for part in ast.walk(argument):
             if not isinstance(part, ast.FormattedValue):
                 continue
             expression = ast.unparse(part.value)
@@ -1288,6 +1373,70 @@ SCAN_BYPASS_MUTANTS = {
         "        raise partial(ToolInputError)(os.getcwd())",
         test_pass_through_error_types_are_only_raised_or_caught_where_the_scan_sees_them,
         "partial(ToolInputError)",
+    ),
+    # PR #25 review L1-L3: Elliot's variants that the r0 scan missed, verbatim.
+    "except-as-shadows-a-parameter": (
+        "        try:\n"
+        "            open(path)\n"
+        "        except OSError as path:\n"
+        '            raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by except ... as",
+    ),
+    "match-as-shadows-a-parameter": (
+        "        import os\n"
+        "        match os.getcwd():\n"
+        "            case str() as path:\n"
+        '                raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by a match capture",
+    ),
+    "import-as-shadows-a-parameter": (
+        "        from os import environ as path\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by an import",
+    ),
+    "nested-def-shadows-a-parameter": (
+        "        def path():\n"
+        "            pass\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by a def or class",
+    ),
+    "nested-class-shadows-a-parameter": (
+        "        class path:\n"
+        "            pass\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by a def or class",
+    ),
+    # Elliot's variant interpolated `{value}`, which is a local of `_data_type` (so the global
+    # was never read there); this one uses an audited name that the function does not bind.
+    "global-rewritten-by-another-function": (
+        '        raise ToolInputError(f"数据类型不存在：{path}（{minimum}）")\n\n\n'
+        'minimum = "12.1.3"\n\n\n'
+        "def _set():\n"
+        "    global minimum\n"
+        "    import os\n"
+        "    minimum = os.getcwd()",
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound by a global or nonlocal declaration",
+    ),
+    "host-path-through-a-helper-local": (
+        "        value = _h1()\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}（{value}）")\n\n\n'
+        "def _h1():\n"
+        "    import os\n"
+        "    x = os.getcwd()\n"
+        "    return x",
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound to a host path",
+    ),
+    "host-path-in-a-format-spec": (
+        '        import os\n        raise ToolInputError(f"数据类型不存在：{path:{os.getcwd()}}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "interpolates a host path: {os.getcwd()}",
     ),
     "subclass-of-an-alias": (
         DATA_TYPE_SITE[1] + "\n\n\n"

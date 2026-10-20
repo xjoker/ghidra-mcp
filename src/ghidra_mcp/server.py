@@ -54,10 +54,11 @@ _WELL_KNOWN_ROOTS = (
     "home|Users|tmp|var|opt|srv|data|workspace|root|mnt|private|etc|usr|Volumes|media"
 )
 # A backslash escape (a letter, up to three octal digits, \xHH, \uHHHH, \UHHHHHHHH or one
-# punctuation character) that no further path character follows.
+# ASCII punctuation character) that no further path character follows. Non-ASCII characters
+# count as path characters, so "\数据\项目" or "\Документы" is still a path.
 _LONE_ESCAPE = (
     r"(?:[A-Za-z]|[0-7]{1,3}|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}"
-    r"|[^\sA-Za-z0-9_.~$\\/-])(?![A-Za-z0-9_.~$\\/-])"
+    r"|(?=[!-~])[^A-Za-z0-9_.~$\\/-])(?![A-Za-z0-9_.~$\\/-]|[^\x00-\x7f])"
 )
 _ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_.])/(?=[^\s/])"

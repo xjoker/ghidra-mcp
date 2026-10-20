@@ -672,6 +672,16 @@ HOST_PATH_ERRORS = {
         "RuntimeError：错误详情包含服务端路径",
         r"\Документы\файл",
     ),
+    "windows-root-relative-single-cjk-character": (
+        RuntimeError(r"cannot open \数 (private)"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\数",
+    ),
+    "windows-root-relative-ascii-letter-then-cjk": (
+        RuntimeError(r"cannot open \n项目 (private)"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\n项目",
+    ),
     "path-after-punctuation-is-hidden-too": (
         RuntimeError("sizeof(int)/private width mismatch"),
         "RuntimeError：错误详情包含服务端路径",

@@ -71,8 +71,11 @@ def ensure_context_class_loader() -> None:
     Only the thread that creates the JVM gets ``ghidra.GhidraClassLoader`` as its context
     class loader; threads that JPype attaches later get null. Since the JVM is created on
     a detached helper thread (see ``GhidraRuntime._start_jvm``), every tool worker is such
-    an attached thread, and Java code that calls ``getContextClassLoader()`` without a null
-    check (ServiceLoader lookups, ``getResource``) would fail on it. Under PyGhidra the
+    an attached thread. Java code that uses ``getContextClassLoader()`` without a null check
+    (for example ``getContextClassLoader().getResource(...)``) would fail on it, and Java
+    threads that Ghidra starts from a worker (analysis and decompiler pools) would inherit
+    the null loader. (``ServiceLoader.load`` is not an example: it falls back to the system
+    class loader when the context class loader is null.) Under PyGhidra the
     system class loader is ``GhidraClassLoader``. Leaves a non-null loader untouched, and is
     a no-op until a real JVM runs: jpype is only looked up in ``sys.modules`` so this costs
     nothing before PyGhidra is imported.

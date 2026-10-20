@@ -119,8 +119,8 @@ MCP 客户端应自行拉起 stdio 进程。等价通用配置如下：
 关闭时的存盘是尽力而为，不是保证：
 
 - 如果关闭时 `close_all` 抛出异常（例如某个程序无法存盘），服务器会记录 traceback，进程以状态码 1 退出，而不是 0 或 143。`close_all` 仍会尝试其余所有已打开的程序，但失败的程序不会存盘。
-- JVM 启动后大约最初一到两秒内，SIGTERM 仍由 JVM 自己处理：进程立即以状态码 143 退出，不排空，也不执行 `close_all`。JVM 在第一次 `program_open` 时启动，因此这段时间内还没有已打开的程序。
-- SIGINT 和 SIGHUP 不走这套关闭流程。JVM 启动后由 JVM 处理它们，进程以状态码 130（SIGINT）或 129（SIGHUP）退出，不执行 `close_all`。请用 SIGTERM 或关闭 stdin 来停止服务器。
+- JVM 启动后大约最初一到两秒内，SIGTERM 仍由 JVM 自己处理：进程立即退出，不排空，也不执行 `close_all`。退出码通常是 143，但 JVM 也可能在启动过程中崩溃并 abort，以状态码 134（SIGABRT）退出，并在工作目录留下一个 `hs_err_pid*.log` 文件。JVM 在第一次 `program_open` 时启动，因此这段时间内还没有已打开的程序。
+- SIGINT 和 SIGHUP 不走这套关闭流程。JVM 启动后由 JVM 处理它们，进程以状态码 130（SIGINT）或 129（SIGHUP）退出，不执行 `close_all`。JVM 启动前，SIGHUP 会立即杀死进程，不执行 `close_all`。JVM 启动前的 SIGINT 要等传输停止后才会结束进程：HTTP 模式下 uvicorn 会立即停止，stdio 模式下进程通常会一直运行到 stdin 关闭。随后进程执行 `close_all`（此时还没有已打开的程序），再被 SIGINT 杀死。请用 SIGTERM 或关闭 stdin 来停止服务器。
 
 ## 文档
 

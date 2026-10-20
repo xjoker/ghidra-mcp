@@ -129,6 +129,32 @@ def test_every_executor_path_sets_the_loader_on_the_worker_before_the_call(
     assert "MainThread" not in fake_java.loaders
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_close_finalizer_sets_the_loader_on_a_worker_that_only_ran_calls_before_the_jvm(
+    fake_java: _FakeJava, workers: int
+) -> None:
+    """L4: the close() finalizer can land on a worker whose last call ran before JVM start."""
+
+    fake_java.started = False
+    executor = GhidraToolExecutor(max_workers=workers)
+    barrier = threading.Barrier(workers)
+
+    def before_the_jvm() -> str:
+        barrier.wait(10)
+        return threading.current_thread().name
+
+    futures = [executor._submit(before_the_jvm) for _ in range(workers)]
+    assert len({future.result(10) for future in futures}) == workers
+    assert fake_java.loaders == {}
+
+    # The JVM starts elsewhere (for example on another worker or the caller's thread).
+    fake_java.started = True
+    seen = executor.close(lambda: (threading.current_thread().name, fake_java.current_loader()))
+
+    assert seen[0].startswith("ghidra-mcp")
+    assert seen[1] is fake_java.system_loader
+
+
 def test_a_failing_loader_update_is_logged_and_the_call_still_runs(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

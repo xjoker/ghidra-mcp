@@ -78,8 +78,11 @@ def ensure_context_class_loader() -> None:
     Only the thread that creates the JVM gets ``ghidra.GhidraClassLoader`` as its context
     class loader; threads that JPype attaches later get null. Since the JVM is created on
     a detached helper thread (see ``GhidraRuntime._start_jvm``), every tool worker is such
-    an attached thread, and Java code that calls ``getContextClassLoader()`` without a null
-    check (ServiceLoader lookups, ``getResource``) would fail on it. Under PyGhidra the
+    an attached thread. Java code that uses ``getContextClassLoader()`` without a null check
+    (for example ``getContextClassLoader().getResource(...)``) would fail on it, and Java
+    threads that Ghidra starts from a worker (analysis and decompiler pools) would inherit
+    the null loader. (``ServiceLoader.load`` is not an example: it falls back to the system
+    class loader when the context class loader is null.) Under PyGhidra the
     system class loader is ``GhidraClassLoader``. Leaves a non-null loader untouched, and is
     a no-op until a real JVM runs: jpype is only looked up in ``sys.modules`` so this costs
     nothing before PyGhidra is imported.
@@ -96,6 +99,10 @@ def ensure_context_class_loader() -> None:
 # Keeps the Java-side SIGTERM handler proxy (and the handler it replaced) alive.
 _JVM_SIGTERM_FORWARDER: list[Any] = []
 
+# A Python SIGTERM handler returns this when the JVM forwarder calls it but it cannot act on
+# the signal; the forwarder then hands SIGTERM to the JVM's previous handler.
+SIGTERM_NOT_HANDLED: Any = object()
+
 
 def _forward_jvm_sigterm_to_python() -> None:
     """Hand SIGTERM back to Python once the JVM has started.
@@ -105,8 +112,9 @@ def _forward_jvm_sigterm_to_python() -> None:
     in ``MCPService.run`` never ran. This replaces the Java handler with one that calls the
     Python-level SIGTERM handler that is current at signal time (ghidra-mcp's own handler,
     or uvicorn's while it serves HTTP). Python's SIG_IGN is honoured. When Python has the
-    default disposition, or the Python handler fails, it falls back to the JVM's previous
-    handler, so library users that never install a handler keep the old behaviour. The
+    default disposition, the Python handler fails, or it returns ``SIGTERM_NOT_HANDLED``, it
+    falls back to the JVM's previous handler, so library users that never install a handler
+    keep the old behaviour. The
     handler runs on a JVM signal thread, so Python handlers reached this way must be
     thread-safe; ghidra-mcp's handler and uvicorn's only set flags. A no-op without a
     real JVM.
@@ -127,8 +135,8 @@ def _forward_jvm_sigterm_to_python() -> None:
                 return
             if callable(handler):
                 try:
-                    handler(signal.SIGTERM, None)
-                    return
+                    if handler(signal.SIGTERM, None) is not SIGTERM_NOT_HANDLED:
+                        return
                 except BaseException:
                     _LOGGER.exception("Python SIGTERM handler failed; using the JVM default")
             previous[0].handle(sig)

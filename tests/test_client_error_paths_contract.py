@@ -28,11 +28,13 @@ from __future__ import annotations
 import ast
 import asyncio
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import sys
 from typing import Any
 
 import pytest
@@ -628,6 +630,37 @@ HOST_PATH_ERRORS = {
         "RuntimeError：错误详情包含服务端路径",
         "/Demangler/private_type",
     ),
+    # PR #22 review r2 N2: narrowing the escape and root-name branches keeps these.
+    "windows-root-relative-users-only": (
+        RuntimeError(r"cannot list \Users"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\Users",
+    ),
+    "windows-root-relative-single-segment": (
+        RuntimeError(r"cannot read \private.ini"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\private.ini",
+    ),
+    "windows-root-relative-single-letter-segments": (
+        RuntimeError(r"cannot read \p\r\private"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\p\r\private",
+    ),
+    "windows-root-relative-escape-like-name": (
+        RuntimeError(r"cannot read \x41.private"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\x41.private",
+    ),
+    "windows-root-relative-hidden-directory": (
+        RuntimeError(r"cannot read \.private\prefs"),
+        "RuntimeError：错误详情包含服务端路径",
+        r"\.private",
+    ),
+    "path-after-punctuation-is-hidden-too": (
+        RuntimeError("sizeof(int)/private width mismatch"),
+        "RuntimeError：错误详情包含服务端路径",
+        "/private",
+    ),
 }
 
 
@@ -692,6 +725,16 @@ PASS_THROUGH_ERRORS = {
     # Relative paths that merely contain a well-known root name as a word are kept.
     "relative-path-with-root-word": RuntimeError("missing data_files/homework/variables.txt"),
     "plain-slash-words": RuntimeError("read/write and input/output failed"),
+    # PR #22 review r2 N2: lone backslash escapes and root names that only end a word.
+    "escaped-newline": RuntimeError(r"Unexpected character '\n' in string"),
+    "regex-escape": RuntimeError(r"regex \d+ failed"),
+    "hex-escape": RuntimeError(r"escape \x41 invalid"),
+    "unicode-escape": RuntimeError(r"cannot parse \u00e9"),
+    "escaped-quote": RuntimeError(r"unexpected \' at offset 3"),
+    "root-name-ends-a-word": RuntimeError("Ghidra: missing processor spec x86/data"),
+    "root-name-ends-a-list": RuntimeError("options: a/b/tmp"),
+    "root-name-ends-a-word-list": RuntimeError("expected one of: and/or/etc"),
+    "root-name-ends-a-language-id": RuntimeError("language id ARM:LE:32:v8/var"),
 }
 
 
@@ -970,29 +1013,155 @@ HOST_PATH_NAMES = re.compile(
 )
 
 
-def _pass_through_sites() -> list[tuple[str, int, ast.expr]]:
-    sites = []
+# Where a value interpolated by name may come from: it must not read a host path either
+# (PR #22 review r2 N1, `value = str(Path.home())` before an audited `{value}`).
+HOST_PATH_SOURCES = re.compile(
+    rf"{HOST_PATH_NAMES.pattern}|\bPath\b|pathlib|\bos\.|tempfile|\bsys\.|\bopen\("
+)
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+@dataclass
+class _Module:
+    path: Path
+    tree: ast.Module
+    parents: dict[ast.AST, ast.AST]
+
+    @property
+    def where(self) -> str:
+        return str(self.path.relative_to(SRC))
+
+
+def _modules() -> list[_Module]:
+    modules = []
     for source in sorted(SRC.rglob("*.py")):
         tree = ast.parse(source.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        modules.append(_Module(source, tree, parents))
+    return modules
+
+
+def _names_a_type(node: ast.AST, names: set[str]) -> bool:
+    return (isinstance(node, ast.Name) and node.id in names) or (
+        isinstance(node, ast.Attribute) and node.attr in names
+    )
+
+
+def _pass_through_names(modules: list[_Module]) -> set[str]:
+    """PASS_THROUGH_TYPES plus every alias of them: `import ... as X` and `X = ToolInputError`."""
+
+    names = set(PASS_THROUGH_TYPES)
+    while True:
+        found = set()
+        for module in modules:
+            for node in ast.walk(module.tree):
+                if isinstance(node, ast.ImportFrom):
+                    found |= {a.asname for a in node.names if a.asname and a.name in names}
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                    if _names_a_type(node.value, names):
+                        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                        found |= {t.id for t in targets if isinstance(t, ast.Name)}
+        if found <= names:
+            return names
+        names |= found
+
+
+def _pass_through_sites() -> list[tuple[str, int, ast.expr, _Module, ast.Call]]:
+    modules = _modules()
+    names = _pass_through_names(modules)
+    sites = []
+    for module in modules:
+        for node in ast.walk(module.tree):
+            if not isinstance(node, ast.Call) or not _names_a_type(node.func, names):
                 continue
-            func = node.func
-            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name not in PASS_THROUGH_TYPES:
-                continue
-            where = f"{source.relative_to(SRC)}:{node.lineno}"
+            where = f"{module.where}:{node.lineno}"
             arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
-            assert arguments, f"{where}: {name}() without a message"
-            sites.extend((where, node.lineno, argument) for argument in arguments)
+            assert arguments, f"{where}: {ast.unparse(node.func)}() without a message"
+            sites.extend((where, node.lineno, argument, module, node) for argument in arguments)
     return sites
+
+
+def _parameters(scope: ast.AST) -> set[str]:
+    arguments = scope.args  # type: ignore[attr-defined]
+    every = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+    every += [arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None]
+    return {arg.arg for arg in every}
+
+
+def _bound_value(module: _Module, target: ast.Name) -> ast.AST | None:
+    """The expression a `name = ...` / `for name in ...` / `with ... as name` binding reads."""
+
+    node: ast.AST = target
+    while node in module.parents:
+        parent = module.parents[node]
+        if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            return parent.value
+        if isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)):
+            return parent.iter
+        if isinstance(parent, ast.withitem):
+            return parent.context_expr
+        if not isinstance(parent, (ast.Tuple, ast.List, ast.Starred)):
+            return None
+        node = parent
+    return None
+
+
+def _reads_host_path(module: _Module, value: ast.AST, depth: int = 0) -> bool:
+    """Whether ``value`` names a host path source, following module-level helpers it calls."""
+
+    if HOST_PATH_SOURCES.search(ast.unparse(value)):
+        return True
+    if depth >= 3:
+        return False
+    helpers = {
+        node.name: node
+        for node in module.tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for call in ast.walk(value):
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+            helper = helpers.get(call.func.id)
+            for node in ast.walk(helper) if helper is not None else ():
+                if isinstance(node, ast.Return) and node.value is not None:
+                    if _reads_host_path(module, node.value, depth + 1):
+                        return True
+    return False
+
+
+def _provenance_problems(module: _Module, site: ast.Call, name: str) -> list[str]:
+    """Check where an interpolated name comes from: a parameter or a host-path-free binding."""
+
+    scope: ast.AST = site
+    while scope in module.parents:
+        scope = module.parents[scope]
+        if isinstance(scope, _SCOPES) or isinstance(scope, ast.Module):
+            body = scope.body if isinstance(scope, ast.Module) else [scope]
+            stores = [
+                node
+                for statement in body
+                for node in ast.walk(statement)
+                if isinstance(node, ast.Name)
+                and node.id == name
+                and isinstance(node.ctx, ast.Store)
+                and (not isinstance(scope, ast.Module) or not isinstance(statement, _SCOPES))
+            ]
+            problems = []
+            for store in stores:
+                value = _bound_value(module, store)
+                if value is None:
+                    problems.append(f"{{{name}}} is bound in a way the scan does not follow")
+                elif _reads_host_path(module, value):
+                    problems.append(f"{{{name}}} is bound to a host path: {ast.unparse(value)}")
+            if stores or (not isinstance(scope, ast.Module) and name in _parameters(scope)):
+                return problems
+    return [f"{{{name}}} is neither a parameter nor assigned"]
 
 
 def test_pass_through_error_messages_only_interpolate_audited_client_values() -> None:
     sites = _pass_through_sites()
     assert len(sites) >= 50, len(sites)
     problems = []
-    for where, _, argument in sites:
+    for where, _, argument, module, call in sites:
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
             if HOST_PATH_NAMES.search(argument.value) and "/" in argument.value:
                 problems.append(f"{where}: constant message looks like it names a host path")
@@ -1010,6 +1179,10 @@ def test_pass_through_error_messages_only_interpolate_audited_client_values() ->
                 problems.append(f"{where}: interpolates a host path: {{{expression}}}")
             elif expression not in AUDITED_INTERPOLATIONS:
                 problems.append(f"{where}: unaudited interpolation {{{expression}}}")
+            elif isinstance(part.value, ast.Name):
+                problems += [
+                    f"{where}: {p}" for p in _provenance_problems(module, call, expression)
+                ]
     assert problems == []
 
 
@@ -1017,12 +1190,146 @@ def test_pass_through_error_types_have_no_subclasses_and_stay_the_only_trusted_o
     from ghidra_mcp import server
 
     assert {error.__name__ for error in server._CLIENT_SAFE_ERRORS} == PASS_THROUGH_TYPES
-    for source in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
+    modules = _modules()
+    names = _pass_through_names(modules)
+    for module in modules:
+        for node in ast.walk(module.tree):
             if isinstance(node, ast.ClassDef) and node.name not in PASS_THROUGH_TYPES:
                 bases = {ast.unparse(base).rsplit(".", 1)[-1] for base in node.bases}
-                assert not bases & PASS_THROUGH_TYPES, f"{source.name}: {node.name}"
+                assert not bases & names, f"{module.path.name}: {node.name}"
+
+
+def test_pass_through_error_types_are_only_raised_or_caught_where_the_scan_sees_them() -> None:
+    # A pass-through type handed to a factory (`partial(ToolInputError, ...)`, a dict of error
+    # types, ...) would build messages the scan above never sees (PR #22 review r2 N1).
+    modules = _modules()
+    names = _pass_through_names(modules)
+    problems = []
+    for module in modules:
+        for node in ast.walk(module.tree):
+            if not _names_a_type(node, names) or not isinstance(node.ctx, ast.Load):
+                continue
+            parent = module.parents[node]
+            if isinstance(parent, ast.Tuple):
+                parent = module.parents[parent]
+            if isinstance(parent, ast.Call) and parent.func is node:
+                continue  # a construction site, scanned above
+            if isinstance(parent, (ast.ExceptHandler, ast.Raise, ast.ClassDef)):
+                continue  # caught, raised without a message, or a base (checked above)
+            if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is not None:
+                targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                if all(isinstance(t, ast.Name) for t in targets):
+                    if all(t.id in names for t in targets):
+                        continue  # an alias, scanned above
+                    if module.where == "server.py" and targets[0].id == "_CLIENT_SAFE_ERRORS":
+                        continue
+            if (
+                isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Name)
+                and parent.func.id in {"isinstance", "issubclass"}
+            ):
+                continue
+            problems.append(f"{module.where}:{node.lineno}: {ast.unparse(parent)}")
+    assert problems == []
+
+
+# The scan must catch these rewrites of a real construction site (PR #22 review r2 N1).
+# M2 and M3 are Elliot's mutants verbatim; the others close the next obvious bypasses.
+DATA_TYPE_SITE = (
+    "tools/operations.py",
+    '        raise ToolInputError(f"数据类型不存在：{path}")',
+)
+SCAN_BYPASS_MUTANTS = {
+    "M2-host-path-rebound-to-audited-name": (
+        "        import pathlib\n"
+        "        value = str(pathlib.Path.home())\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}（{value}）")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound to a host path",
+    ),
+    "M3-aliased-import": (
+        "        from .navigation import ToolInputError as _BadInput\n"
+        "        import os\n"
+        '        raise _BadInput(f"数据类型不存在：{path}（{os.getcwd()}）")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "interpolates a host path",
+    ),
+    "alias-by-assignment": (
+        "        import os\n"
+        "        _Bad = ToolInputError\n"
+        '        raise _Bad(f"数据类型不存在：{path}（{os.getcwd()}）")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "interpolates a host path",
+    ),
+    "parameter-rebound-to-a-host-path": (
+        "        import os\n"
+        "        path = os.getcwd()\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound to a host path",
+    ),
+    "host-path-through-a-module-helper": (
+        "        value = _format_version_hint()\n"
+        '        raise ToolInputError(f"数据类型不存在：{path}（{value}）")\n\n\n'
+        "def _format_version_hint():\n"
+        "    import pathlib\n"
+        "    return str(pathlib.Path.cwd())",
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is bound to a host path",
+    ),
+    "unbound-audited-name": (
+        '        raise ToolInputError(f"数据类型不存在：{path}（{minimum}）")',
+        test_pass_through_error_messages_only_interpolate_audited_client_values,
+        "is neither a parameter nor assigned",
+    ),
+    "type-handed-to-a-factory": (
+        "        from functools import partial\n"
+        "        import os\n"
+        "        raise partial(ToolInputError)(os.getcwd())",
+        test_pass_through_error_types_are_only_raised_or_caught_where_the_scan_sees_them,
+        "partial(ToolInputError)",
+    ),
+    "subclass-of-an-alias": (
+        DATA_TYPE_SITE[1] + "\n\n\n"
+        "from .navigation import ToolInputError as _Base\n\n\n"
+        "class _Leaky(_Base):\n"
+        "    pass",
+        test_pass_through_error_types_have_no_subclasses_and_stay_the_only_trusted_ones,
+        "_Leaky",
+    ),
+}
+
+
+def _scan_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new: str | None) -> None:
+    import shutil
+
+    copy = tmp_path / "ghidra_mcp"
+    shutil.copytree(SRC, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    if new is not None:
+        target = copy / DATA_TYPE_SITE[0]
+        text = target.read_text(encoding="utf-8")
+        assert text.count(DATA_TYPE_SITE[1]) == 1
+        target.write_text(text.replace(DATA_TYPE_SITE[1], new), encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "SRC", copy)
+
+
+def test_pass_through_scans_pass_on_an_unchanged_copy_of_the_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scan_copy(tmp_path, monkeypatch, None)
+    test_pass_through_error_messages_only_interpolate_audited_client_values()
+    test_pass_through_error_types_have_no_subclasses_and_stay_the_only_trusted_ones()
+    test_pass_through_error_types_are_only_raised_or_caught_where_the_scan_sees_them()
+
+
+@pytest.mark.parametrize("mutant", sorted(SCAN_BYPASS_MUTANTS))
+def test_pass_through_scans_catch_bypasses(
+    mutant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new, scan, expected = SCAN_BYPASS_MUTANTS[mutant]
+    _scan_copy(tmp_path, monkeypatch, new)
+    with pytest.raises(AssertionError, match=re.escape(expected)):
+        scan()
 
 
 def test_pass_through_errors_never_show_configured_roots(

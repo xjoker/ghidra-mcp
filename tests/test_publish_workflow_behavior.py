@@ -72,6 +72,9 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     explicit key win over a merged one and the first of several merged mappings win, while
     GitHub Actions does not support merge keys at all. Refusing them keeps the checker from
     depending on two parsers agreeing about merge rules.
+
+    Both checks also apply to the mapping inside an explicit ``!!set``, which PyYAML
+    builds with its own constructor (PR #22 review r2 N3).
     """
 
 
@@ -97,9 +100,14 @@ def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -
     return loader.construct_mapping(node, deep=True)
 
 
+def _construct_unique_set(loader: yaml.SafeLoader, node: yaml.MappingNode) -> set[Any]:
+    return set(_construct_unique_mapping(loader, node))
+
+
 _UniqueKeySafeLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
 )
+_UniqueKeySafeLoader.add_constructor("tag:yaml.org,2002:set", _construct_unique_set)
 
 
 class WorkflowBytesError(ValueError):
@@ -1842,6 +1850,28 @@ def test_workflow_loader_rejects_yaml_merge_keys(
         assert _publish_problems(yaml.safe_load(text)) == []
     with pytest.raises(yaml.constructor.ConstructorError, match="merge key"):
         _load_workflow(text.encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        pytest.param("s: !!set {<<: {b: 2}, c}\n", "merge key", id="merge-key-in-set"),
+        pytest.param("s: !!set\n  <<: {b: 2}\n  c:\n", "merge key", id="block-set-merge-key"),
+        pytest.param("s: !!set {c, c}\n", "found duplicate key", id="duplicate-in-set"),
+    ],
+)
+def test_workflow_loader_applies_its_key_checks_inside_an_explicit_set(
+    text: str, match: str
+) -> None:
+    # PR #22 review r2 N3: PyYAML builds `!!set` with its own constructor, which used to skip
+    # both checks and silently expand the merge key.
+    assert yaml.safe_load(text)["s"] in ({"b", "c"}, {"c"})
+    with pytest.raises(yaml.constructor.ConstructorError, match=match):
+        _load_workflow(text.encode("ascii"))
+
+
+def test_workflow_loader_still_builds_a_plain_set() -> None:
+    assert _load_workflow(b"s: !!set {a, b}\n") == {"s": {"a", "b"}}
 
 
 def test_workflow_loader_treats_a_quoted_merge_marker_as_an_ordinary_key() -> None:

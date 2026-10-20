@@ -10,8 +10,10 @@ import hmac
 from importlib.metadata import PackageNotFoundError, version as package_version
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 from threading import Condition
 from typing import Any, Callable
@@ -24,6 +26,56 @@ from starlette.responses import JSONResponse, Response
 
 from .concurrency import ProgramGates, program_resource_key
 from .registry import ToolDefinition, ToolRegistry
+from .runtime import WorkspaceError
+from .tools.navigation import ToolInputError
+
+
+_LOGGER = logging.getLogger(__name__)
+
+# Error types whose text ghidra-mcp writes itself. Each of their messages is audited to be
+# free of host paths and may deliberately echo a value the client supplied (for example a
+# binary path or a Ghidra data type path), so their text reaches the client unchanged.
+_CLIENT_SAFE_ERRORS = (WorkspaceError, ToolInputError)
+
+# Something that looks like an absolute host path: a POSIX "/x" that does not continue an
+# ASCII word or a relative "./" / "../" segment (this also covers "file:///x" URLs), a Windows
+# drive "C:\" or "C:/", or a UNC "\\server" prefix.
+_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.])/(?=[^\s/])|(?<![A-Za-z0-9])[A-Za-z]:[\\/]|\\\\")
+
+
+class _ClientSafeToolError(RuntimeError):
+    """Replaces an error whose text would show host paths to the MCP client."""
+
+
+def _client_safe_error(tool_name: str, error: Exception) -> Exception | None:
+    """Return a path-free stand-in for ``error``, or None when its text may reach the client.
+
+    FastMCP returns ``str(error)`` of any exception a tool raises to the client, over stdio
+    and Streamable HTTP alike. Errors that ghidra-mcp does not word itself (Java exceptions
+    from Ghidra, ``OSError``, PyGhidra start-up failures, ``Path.resolve`` symlink loops, ...)
+    can carry install, project or input paths. Such text is logged server-side in full and
+    the client only gets the error type plus, for ``OSError``, its path-free reason.
+    """
+
+    if isinstance(error, _CLIENT_SAFE_ERRORS):
+        return None
+    text = str(error)
+    if not _ABSOLUTE_PATH.search(text):
+        return None
+    _LOGGER.error(
+        "工具 %s 失败，错误信息含服务端路径，已对客户端隐去：%s",
+        tool_name,
+        text,
+        exc_info=error,
+    )
+    reason = ""
+    if isinstance(error, OSError) and error.strerror:
+        strerror = str(error.strerror)
+        if not _ABSOLUTE_PATH.search(strerror):
+            reason = f"{strerror}；"
+    return _ClientSafeToolError(
+        f"{type(error).__name__}：{reason}错误详情包含服务端路径，已对客户端隐去，完整信息见服务端日志"
+    )
 
 
 class ExecutorClosedError(RuntimeError):
@@ -117,19 +169,25 @@ class GhidraToolExecutor:
 def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any) -> Any:
     @wraps(tool.handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        # 单 worker 不使用闸门，因此不推导资源键，保持与单线程执行器相同的调用路径。
-        # 多 worker 时资源键（含 Path.resolve）放到线程池，避免在事件循环线程上做 realpath/lstat。
-        if executor.max_workers > 1:
-            resource = await asyncio.to_thread(resource_namer, kwargs)
-        else:
-            resource = None
-        return await executor.run(
-            tool.handler,
-            args,
-            kwargs,
-            resource=resource,
-            exclusive=tool.mutates,
-        )
+        try:
+            # 单 worker 不使用闸门，因此不推导资源键，保持与单线程执行器相同的调用路径。
+            # 多 worker 时资源键（含 Path.resolve）放到线程池，避免在事件循环线程上做 realpath/lstat。
+            if executor.max_workers > 1:
+                resource = await asyncio.to_thread(resource_namer, kwargs)
+            else:
+                resource = None
+            return await executor.run(
+                tool.handler,
+                args,
+                kwargs,
+                resource=resource,
+                exclusive=tool.mutates,
+            )
+        except Exception as error:
+            replacement = _client_safe_error(tool.name, error)
+            if replacement is None:
+                raise
+            raise replacement from error
 
     return wrapped
 

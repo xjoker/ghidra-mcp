@@ -44,7 +44,11 @@ def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
     try:
         lines = properties.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
-        raise WorkspaceError(f"无法确认 Ghidra 版本：未能读取 {properties}") from error
+        # Host paths go to the server log only; the client-facing text stays path-free.
+        _LOGGER.error("无法确认 Ghidra 版本：未能读取 %s：%s", properties, error)
+        raise WorkspaceError(
+            "无法确认 Ghidra 版本：未能读取安装目录中的 application.properties"
+        ) from error
     for line in lines:
         key, separator, value = line.partition("=")
         if separator and key.strip() == "application.version":
@@ -53,7 +57,10 @@ def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
                 major, minor, patch = match.groups()
                 return int(major), int(minor), int(patch or 0)
             break
-    raise WorkspaceError(f"无法确认 Ghidra 版本：{properties} 缺少有效的 application.version")
+    _LOGGER.error("无法确认 Ghidra 版本：%s 缺少有效的 application.version", properties)
+    raise WorkspaceError(
+        "无法确认 Ghidra 版本：安装目录中的 application.properties 缺少有效的 application.version"
+    )
 
 
 def _detach_current_thread_from_jvm() -> None:
@@ -146,7 +153,10 @@ class GhidraRuntime:
         with self._lock:
             if self._launcher is None:
                 if not self.install_dir.is_dir():
-                    raise WorkspaceError(f"Ghidra 安装目录不存在：{self.install_dir}")
+                    _LOGGER.error("Ghidra 安装目录不存在：%s", self.install_dir)
+                    raise WorkspaceError(
+                        "Ghidra 安装目录不存在：请将 GHIDRA_INSTALL_DIR 指向有效的 Ghidra 安装目录"
+                    )
                 version = _read_ghidra_version(self.install_dir)
                 if version < _MINIMUM_GHIDRA_VERSION:
                     detected = _format_version(version)
@@ -336,10 +346,14 @@ class ProgramWorkspace:
         analyze: bool = True,
     ) -> str:
         binary = binary_path.resolve()
+        # The resolved path and the input root are host paths: log them, and echo back only
+        # the path exactly as the client supplied it.
         if self.input_root is not None and not binary.is_relative_to(self.input_root):
-            raise WorkspaceError(f"输入路径超出允许的输入根目录：{self.input_root}")
+            _LOGGER.warning("输入路径 %s 超出允许的输入根目录 %s", binary, self.input_root)
+            raise WorkspaceError("输入路径超出允许的输入根目录（GHIDRA_MCP_INPUT_ROOT）")
         if not binary.is_file():
-            raise WorkspaceError(f"输入二进制不存在：{binary}")
+            _LOGGER.warning("输入二进制不存在：%s", binary)
+            raise WorkspaceError(f"输入二进制不存在：{binary_path}")
         project_name = _persistent_project_name(binary)
         self.runtime.ensure_started()
         effective_location = (

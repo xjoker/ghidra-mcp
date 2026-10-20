@@ -984,6 +984,14 @@ def test_function_create_does_not_follow_the_fall_through_of_a_call_that_does_no
         )
 
 
+def _registry_definitions() -> list[object]:
+    from ghidra_mcp.tools import writes
+
+    registry = ToolRegistry()
+    writes.register_write_tools(registry, FakeWorkspace())
+    return list(registry.enabled_tools())
+
+
 def _straight_line(count: int) -> dict[str, FakeInstruction]:
     """``count`` one-byte instructions from 00400100, each falling through to the next."""
     start = 0x00400100
@@ -995,14 +1003,22 @@ def _straight_line(count: int) -> dict[str, FakeInstruction]:
     return chain
 
 
+def test_function_create_documents_the_predicted_instruction_limit() -> None:
+    from ghidra_mcp.tools import writes
+
+    assert writes._MAX_PREDICTED_INSTRUCTIONS == 20_000
+    function_create = next(
+        tool for tool in _registry_definitions() if tool.name == "function_create"
+    )
+    assert "推算最多 20000 条指令" in function_create.description
+
+
 @pytest.mark.parametrize(("count", "allowed"), [(20_000, True), (20_001, False)])
 def test_function_create_pins_the_predicted_instruction_limit(
     monkeypatch: pytest.MonkeyPatch, count: int, allowed: bool
 ) -> None:
     # Review round 2 N3: exactly 20,000 predicted instructions are allowed, one more is not.
-    from ghidra_mcp.tools import writes
-
-    assert writes._MAX_PREDICTED_INSTRUCTIONS == 20_000
+    # Behavioural on purpose (no constant check here), so a changed limit fails on its own.
     workspace = FakeWorkspace()
     workspace.api.program.pseudo.update(_straight_line(count))
     tools = _tools(workspace, monkeypatch)
